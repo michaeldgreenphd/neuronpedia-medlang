@@ -1,24 +1,18 @@
 import { CLTGraph } from '@/app/[modelId]/graph/graph-types';
 import { ATTRIBUTION_GRAPH_SCHEMA, makeGraphPublicAccessGraphUrl, NP_GRAPH_BUCKET } from '@/app/[modelId]/graph/utils';
 import { prisma } from '@/lib/db';
-import {
-  getGraphServerRunpodHostForSourceSet,
-  getIsRunpodServerlessHostForSourceSet,
-} from '@/lib/db/graph-host-source';
 import { getModelById } from '@/lib/db/model';
 import {
-  checkRunpodQueueJobs,
   generateGraphAndUploadToS3,
   getGraphTokenize,
   GRAPH_ANONYMOUS_USER_ID,
   GRAPH_MAX_TOKENS,
   GRAPH_S3_USER_GRAPHS_DIR,
   GRAPH_SLUG_MIN,
+  GraphChatMessage,
   graphGenerateSchemaClient,
   LORSA_MAX_TOKENS,
   LORSA_MODELS,
-  MAX_RUNPOD_JOBS_IN_QUEUE,
-  RUNPOD_BUSY_ERROR,
 } from '@/lib/utils/graph';
 import { RequestOptionalUser, withOptionalUser } from '@/lib/with-user';
 import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
@@ -207,6 +201,7 @@ export const POST = withOptionalUser(async (request: RequestOptionalUser) => {
         validatedData.desiredLogitProb,
         validatedData.modelId,
         validatedData.sourceSetName,
+        validatedData.messages as GraphChatMessage[] | null,
       );
       numTokens = tokenized.input_tokens.length;
       const maxTokens = LORSA_MODELS.includes(validatedData.modelId) ? LORSA_MAX_TOKENS : GRAPH_MAX_TOKENS;
@@ -231,8 +226,14 @@ export const POST = withOptionalUser(async (request: RequestOptionalUser) => {
       validatedData.slug.trim().length < GRAPH_SLUG_MIN
     ) {
       // if slug doesn't exist, generate one based on the prompt
-      // first remove all <> and \n (estimated to be special tokens)
-      const promptReplaced = validatedData.prompt.replace(/<[^>]*>|\n/g, '');
+      // first remove all <> and \n (estimated to be special tokens). Looped because a single
+      // pass can splice two leftover fragments into a fresh <...> (e.g. `<a<b>c>`).
+      let promptReplaced = validatedData.prompt;
+      let beforeReplace = '';
+      while (promptReplaced !== beforeReplace) {
+        beforeReplace = promptReplaced;
+        promptReplaced = promptReplaced.replace(/<[^>]*>|\n/g, '');
+      }
       // remove "user" and "assistant", and "system"
       const promptReplaced2 = promptReplaced.replace(/user|assistant|system/g, '');
       // keeping only alphanumeric characters, and keeping only the first 16 characters
@@ -294,29 +295,6 @@ export const POST = withOptionalUser(async (request: RequestOptionalUser) => {
       expiresIn: 3600, // 1 hour
     });
 
-    // check the queue
-    const isRunpodServerlessHost = await getIsRunpodServerlessHostForSourceSet(
-      validatedData.modelId,
-      validatedData.sourceSetName,
-    );
-    if (isRunpodServerlessHost) {
-      const host = await getGraphServerRunpodHostForSourceSet(validatedData.modelId, validatedData.sourceSetName);
-      if (!host) {
-        throw new Error('No runpod serverless host found.');
-      }
-      const queueNumber = await checkRunpodQueueJobs(host);
-      if (queueNumber > MAX_RUNPOD_JOBS_IN_QUEUE) {
-        // console.log('larger than queue but continuing');
-        return NextResponse.json(
-          {
-            error: RUNPOD_BUSY_ERROR,
-            message: RUNPOD_BUSY_ERROR,
-          },
-          { status: 503 },
-        );
-      }
-    }
-
     await generateGraphAndUploadToS3(
       validatedData.prompt,
       validatedData.modelId,
@@ -331,6 +309,7 @@ export const POST = withOptionalUser(async (request: RequestOptionalUser) => {
       userName || 'Anonymous (CT)',
       validatedData.qkTopFraction,
       validatedData.qkTopk,
+      validatedData.messages as GraphChatMessage[] | null,
     );
 
     // download the file from S3

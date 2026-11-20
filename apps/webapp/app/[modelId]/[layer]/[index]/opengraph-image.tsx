@@ -7,6 +7,8 @@ import { getSourceSet } from '@/lib/db/source';
 import { makeAuthedUserFromSessionOrReturnNull } from '@/lib/db/user';
 import { NEXT_PUBLIC_URL } from '@/lib/env';
 import { makeActivationBackgroundColorWithDFA, replaceHtmlAnomalies } from '@/lib/utils/activations';
+import { applyNeuronDashboard, emptyNeuron, fetchNeuronDashboard } from '@/lib/utils/neuron-dashboards';
+import { getSourceSetNameFromSource, isNeuronInModelRange, isNeuronLayerSource } from '@/lib/utils/source';
 import { Activation } from '@prisma/client';
 import { notFound } from 'next/navigation';
 import { ImageResponse } from 'next/og';
@@ -20,14 +22,43 @@ export const size = {
 
 export const contentType = 'image/png';
 
+// The image shows the top 3 activations.
+const IMAGE_ACTIVATIONS = 3;
+
 export default async function Image({ params }: { params: { modelId: string; layer: string; index: string } }) {
   const user = await makeAuthedUserFromSessionOrReturnNull();
-  const currentNeuron = await getNeuronOptimized(params.modelId, params.layer, params.index, user);
-  if (!currentNeuron) {
+  const sourceSetName = getSourceSetNameFromSource(params.layer);
+  const sourceSet = await getSourceSet(params.modelId, sourceSetName, user);
+  if (!sourceSet) {
     notFound();
   }
-  const sourceSet = await getSourceSet(currentNeuron.modelId, currentNeuron.sourceSetName || '', user);
-  if (!sourceSet) {
+  // DFA picks its top activations from all of them by a different value, so it needs every row.
+  let currentNeuron = await getNeuronOptimized(
+    params.modelId,
+    params.layer,
+    params.index,
+    user,
+    sourceSet.showDfa ? undefined : IMAGE_ACTIVATIONS,
+  );
+  // A source set with file dashboards keeps stats and examples there, and its neurons may have no row.
+  if (sourceSet.externalDashboardsUrl) {
+    if (
+      !currentNeuron &&
+      isNeuronLayerSource(params.layer) &&
+      !isNeuronInModelRange(sourceSet.model, params.layer, params.index)
+    ) {
+      notFound();
+    }
+    const dashboard = await fetchNeuronDashboard(sourceSet.externalDashboardsUrl, params).catch(() => null);
+    if (!dashboard) {
+      notFound();
+    }
+    currentNeuron = applyNeuronDashboard(
+      currentNeuron ?? emptyNeuron(params.modelId, params.layer, params.index, sourceSetName),
+      dashboard,
+    );
+  }
+  if (!currentNeuron) {
     notFound();
   }
 
@@ -243,23 +274,27 @@ export default async function Image({ params }: { params: { modelId: string; lay
               </div>
             ))}
           </div>
-          <div tw="mb-2 mt-5 flex flex-row items-center w-full text-2xl font-bold text-slate-600">Logit Density</div>
-          <div tw="flex flex-row h-[200px] max-h-[200px] w-full items-end border-b border-slate-300 flex-1">
-            {currentNeuron.logits_hist_data_bar_heights.map((val, i) => (
-              <div
-                key={i}
-                tw="flex flex-1"
-                style={{
-                  backgroundColor: logitColorRange[i],
-                  color: 'rgba(0,0,0,0)',
-                  opacity: 0.5,
-                  height: `${(val / maxLogitHist) * 100}%`,
-                }}
-              >
-                .
-              </div>
-            ))}
-          </div>
+          {currentNeuron.logits_hist_data_bar_heights.length > 0 && (
+            <div tw="mb-2 mt-5 flex flex-row items-center w-full text-2xl font-bold text-slate-600">Logit Density</div>
+          )}
+          {currentNeuron.logits_hist_data_bar_heights.length > 0 && (
+            <div tw="flex flex-row h-[200px] max-h-[200px] w-full items-end border-b border-slate-300 flex-1">
+              {currentNeuron.logits_hist_data_bar_heights.map((val, i) => (
+                <div
+                  key={i}
+                  tw="flex flex-1"
+                  style={{
+                    backgroundColor: logitColorRange[i],
+                    color: 'rgba(0,0,0,0)',
+                    opacity: 0.5,
+                    height: `${(val / maxLogitHist) * 100}%`,
+                  }}
+                >
+                  .
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
       <div tw="flex flex-col mt-8 justify-start w-full">

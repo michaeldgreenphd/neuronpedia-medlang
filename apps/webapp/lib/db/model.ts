@@ -1,12 +1,8 @@
 import { prisma } from '@/lib/db';
 import { AuthenticatedUser } from '@/lib/with-user';
 import { Model, Visibility } from '@prisma/client';
+import { cache } from 'react';
 import { AllowUnlistedFor, userCanAccessClause } from './userCanAccess';
-
-export const REPLACE_MODEL_ID_MAP_FOR_LW_TEMPORARY_REDIRECT = {
-  'llama31-8b-it': 'llama3.1-8b-it',
-  'qwen25-7b-it': 'qwen2.5-7b-it',
-};
 
 // for globalModels, return unlisted to everyone, but filter them out in the UI
 export const getGlobalModels = async (user?: AuthenticatedUser | null) => {
@@ -60,6 +56,33 @@ export const getModelById = async (modelId: string, user?: AuthenticatedUser | n
   return model;
 };
 
+// No access check: check access first. Cached per request, so a page and its metadata share one query.
+export const getModelLayerCounts = cache(async (modelId: string) =>
+  prisma.model.findUnique({
+    where: { id: modelId },
+    select: { layers: true, neuronsPerLayer: true },
+  }),
+);
+
+// The reverse of the model id in the URL: given what HuggingFace calls a model, find ours.
+//
+// `findFirst` rather than `findUnique` because the access clause is an extra condition, which
+// `findUnique` does not accept. `hfRepoId` is unique in the schema, so this is still at most one
+// row -- a caller who cannot see it gets null, the same as an unknown repo.
+export const getModelByHfRepoId = async (hfRepoId: string, user?: AuthenticatedUser | null) =>
+  prisma.model.findFirst({
+    where: {
+      hfRepoId,
+      ...userCanAccessClause(user, AllowUnlistedFor.EVERYONE),
+    },
+  });
+
+// Whichever model claims this repo, visibility ignored. For deciding whether a write would collide
+// with the unique index, never for serving to a user: a PRIVATE model still occupies the repo id,
+// and `getModelByHfRepoId` would not see it.
+export const getModelByHfRepoIdIgnoringAccess = async (hfRepoId: string) =>
+  prisma.model.findUnique({ where: { hfRepoId } });
+
 // sometimes transformerlens model IDs do not match our model IDs, so we need to replace them
 export const getTransformerLensModelIdIfExists = async (modelId: string) => {
   const model = await getModelById(modelId);
@@ -112,6 +135,7 @@ export const createModelAdmin = async (
   layers: number,
   owner: string,
   user: AuthenticatedUser,
+  hfRepoId?: string | null,
 ) =>
   prisma.model.create({
     data: {
@@ -123,5 +147,6 @@ export const createModelAdmin = async (
       layers,
       neuronsPerLayer: 0,
       owner,
+      hfRepoId: hfRepoId ?? null,
     },
   });

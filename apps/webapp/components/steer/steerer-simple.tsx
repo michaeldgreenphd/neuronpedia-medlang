@@ -14,9 +14,9 @@ import { LoadingSpinner } from '@/components/svg/loading-spinner';
 import {
   ChatMessage,
   FeaturePreset,
-  STEER_FREQUENCY_PENALTY,
   STEER_MAX_PROMPT_CHARS,
   STEER_N_COMPLETION_TOKENS_MAX,
+  STEER_PRESENCE_PENALTY,
   STEER_SEED,
   STEER_SPECIAL_TOKENS,
   STEER_STRENGTH_MULTIPLIER,
@@ -33,6 +33,9 @@ import { useEffect, useRef, useState } from 'react';
 
 const MAX_MESSAGE_LENGTH_CHARS = 128;
 
+// Callers embedding this component in a demo may not know the model yet.
+const FALLBACK_MODEL_ID = 'gemma-2-2b-it';
+
 export default function SteererSimple({
   initialModelId,
   cappedHeight,
@@ -44,16 +47,8 @@ export default function SteererSimple({
   showOptionsButton?: boolean;
   excludedPresetNames?: string[];
 }) {
-  const [isInitialPageLoad, setInitialPageLoad] = useState(true); // track this
-
-  const [modelId, setModelId] = useState(initialModelId);
+  const [modelId] = useState(initialModelId || FALLBACK_MODEL_ID);
   const [featurePresets, setFeaturePresets] = useState<FeaturePreset[]>([]);
-
-  // INFO: on pageLoad, will crash if no initial model
-  if (isInitialPageLoad && !initialModelId) {
-    setModelId('gemma-2-2b-it');
-    setInitialPageLoad(false);
-  }
 
   function loadPresets() {
     fetch('/api/steer/presets', {
@@ -87,7 +82,7 @@ export default function SteererSimple({
   const [typedInText, setTypedInText] = useState('');
   const [steerTokens, setSteerTokens] = useState(48);
   const [temperature, setTemperature] = useState(STEER_TEMPERATURE);
-  const [freqPenalty, setFreqPenalty] = useState(STEER_FREQUENCY_PENALTY);
+  const [presencePenalty, setPresencePenalty] = useState(STEER_PRESENCE_PENALTY);
   const [strMultiple, setStrMultiple] = useState(STEER_STRENGTH_MULTIPLIER);
   const [seed, setSeed] = useState(STEER_SEED);
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -124,8 +119,8 @@ export default function SteererSimple({
     })
       .then((response) => {
         if (response.status !== 200) {
-          // INFO: DO NOT alert to user; this error only indicates that the
-          // hardcoded savedSteerOutput did not exist. Messages still work!
+          // A missing saved output is recoverable: the chat still works, so log
+          // it instead of surfacing an error to the user.
           console.error('Error loading saved steer output!');
           return null;
         }
@@ -140,7 +135,7 @@ export default function SteererSimple({
         if (resp.settings) {
           setTemperature(resp.settings.temperature);
           setSteerTokens(resp.settings.n_tokens);
-          setFreqPenalty(resp.settings.freq_penalty);
+          setPresencePenalty(resp.settings.presence_penalty);
           setSeed(resp.settings.seed);
           setStrMultiple(resp.settings.strength_multiplier);
           setSteerSpecialTokens(resp.settings.steer_special_tokens);
@@ -216,7 +211,7 @@ export default function SteererSimple({
         features: selectedFeaturesStrengthOverridden,
         temperature,
         n_tokens: steerTokens,
-        freq_penalty: freqPenalty,
+        presence_penalty: presencePenalty,
         seed: randomSeed ? Math.floor(Math.random() * 200000000 - 100000000) : seed,
         strength_multiplier: strMultiple,
         steer_special_tokens: steerSpecialTokens,
@@ -704,23 +699,6 @@ export default function SteererSimple({
                     }}
                     className="max-w-[80px] flex-1 rounded-md border-amber-400 py-1 text-center text-xs text-amber-800"
                     value={temperature}
-                  />
-                </div>
-                <div className="flex w-full flex-row items-center justify-center gap-x-3">
-                  <div className="w-[100px] text-center text-[12px] font-medium leading-tight text-amber-800">
-                    Freq Penalty
-                  </div>
-                  <input
-                    type="number"
-                    onChange={(e) => {
-                      if (parseFloat(e.target.value) > 2 || parseFloat(e.target.value) < -2) {
-                        alert('Freq penalty must be >= -2 and <= 2');
-                      } else {
-                        setFreqPenalty(parseFloat(e.target.value));
-                      }
-                    }}
-                    className="max-w-[80px] flex-1 rounded-md border-amber-400 py-1 text-center text-xs text-amber-800"
-                    value={freqPenalty}
                   />
                 </div>
                 <div className="flex w-full flex-row items-center justify-center gap-x-3">

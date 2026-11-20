@@ -1,8 +1,10 @@
-import { getOneRandomServerHostForSource } from '@/lib/db/inference-host-source';
+import { INFERENCE_BASE_PATH } from '@/lib/api/inference-types';
+import { resolveHost } from '@/lib/db/compute-host';
 import { getTransformerLensModelIdIfExists } from '@/lib/db/model';
-import { INFERENCE_SERVER_SECRET, USE_LOCALHOST_INFERENCE } from '@/lib/env';
+import { INFERENCE_SERVER_SECRET } from '@/lib/env';
+import { INFERENCE_REQUEST_TIMEOUT_MS } from '@/lib/utils/inference';
 import { withOptionalUser } from '@/lib/with-user';
-import { BASE_PATH } from 'neuronpedia-inference-client';
+import { ComputeService } from '@prisma/client';
 import { NextResponse } from 'next/server';
 
 type RequestBody = {
@@ -37,15 +39,16 @@ export const POST = withOptionalUser(async (request) => {
   }
 
   try {
-    const serverHost = await getOneRandomServerHostForSource(modelId, sourceId, request.user);
-    if (!serverHost) {
-      return NextResponse.json({ error: 'No inference host found' }, { status: 500 });
-    }
+    const serverHost = await resolveHost({
+      service: ComputeService.INFERENCE,
+      modelId,
+      sourceId,
+      user: request.user,
+    });
 
     const transformerLensModelId = await getTransformerLensModelIdIfExists(modelId);
 
-    const base = (USE_LOCALHOST_INFERENCE ? undefined : serverHost) || serverHost;
-    const url = `${base}${BASE_PATH}/util/similarity-matrix-pred`;
+    const url = `${serverHost}${INFERENCE_BASE_PATH}/util/similarity-matrix-pred`;
 
     const resp = await fetch(url, {
       method: 'POST',
@@ -60,6 +63,7 @@ export const POST = withOptionalUser(async (request) => {
         text,
       }),
       cache: 'no-cache',
+      signal: AbortSignal.timeout(INFERENCE_REQUEST_TIMEOUT_MS),
     });
 
     if (!resp.ok) {

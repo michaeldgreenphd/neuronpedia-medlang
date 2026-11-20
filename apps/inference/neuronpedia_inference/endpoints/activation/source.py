@@ -1,26 +1,31 @@
 import logging
 import re
 
-import nnsight
 import numpy as np
 import torch
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
-from neuronpedia_inference_client.models.activation_source_post200_response import (
-    ActivationSourcePost200Response,
-)
-from neuronpedia_inference_client.models.activation_source_post200_response_results_inner import (
-    ActivationSourcePost200ResponseResultsInner,
-)
-from neuronpedia_inference_client.models.activation_source_post_request import (
-    ActivationSourcePostRequest,
-)
-from nnterp import StandardizedTransformer
 
-# from transformer_lens.model_bridge import TransformerBridge
 from neuronpedia_inference.config import Config
-from neuronpedia_inference.sae_manager import SAEManager
-from neuronpedia_inference.shared import Model, with_request_lock
+from neuronpedia_inference.endpoints.activation.single import bos_positions
+from neuronpedia_inference.engine_adapter import (
+    BackendUnsupported,
+    capture_padded_cache_async,
+)
+from neuronpedia_inference.inference_utils.neuron_act_range import NeuronActRangeError, top_rare_neurons
+from neuronpedia_inference.memory_cost import activation_source_cost
+from neuronpedia_inference.sae_manager import SAE_TYPE, SAEManager
+from neuronpedia_inference.schemas import (
+    ActivationSourceRequest,
+    ActivationSourceResponse,
+    ActivationSourceResult,
+)
+from neuronpedia_inference.shared import (
+    Model,
+    RecoverableOutOfMemory,
+    recover_from_oom,
+    with_request_lock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,27 +36,38 @@ MAX_BATCH_SIZE = 4
 
 ROUND_DECIMALS = 3
 
+# Top neurons per token for an MLP neuron layer when the request gives no topK.
+DEFAULT_NEURON_TOP_K = 64
 
-@router.post("/activation/source")
-@with_request_lock()
+
+@router.post("/activation/source", responses={200: {"model": ActivationSourceResponse}})
+@with_request_lock(exclusive=False, cost=activation_source_cost)
 async def activation_source(
-    request: ActivationSourcePostRequest,
+    request: ActivationSourceRequest,
 ):
     config = Config.get_instance()
-    if request.model not in config.get_valid_model_ids():
-        logger.error(
-            "Invalid model: %s, valid models are %s",
-            request.model,
-            config.get_valid_model_ids(),
+    config.check_requested_model(request.model)
+
+    # MAX_BATCH_SIZE only divided the per-prompt token limit below; the prompt COUNT was
+    # never checked, so the batch (and with it the padded capture and the response) was
+    # bounded only by what the client chose to send.
+    if len(request.prompts) == 0:
+        return JSONResponse(
+            content={"error": "At least one prompt is required"},
+            status_code=400,
         )
-        return JSONResponse(content={"error": "Invalid model"}, status_code=400)
+    if len(request.prompts) > MAX_BATCH_SIZE:
+        return JSONResponse(
+            content={"error": f"Batch size {len(request.prompts)} exceeds maximum of {MAX_BATCH_SIZE}"},
+            status_code=400,
+        )
 
     # if the request doesn't start with the bos, prepend it
     bos_token = Model.get_instance().tokenizer.bos_token
     # iterate through prompts and prepend bos if needed
     processed_prompts = []
     for prompt in request.prompts:
-        if not prompt.startswith(bos_token):
+        if bos_token and not prompt.startswith(bos_token):
             prompt = bos_token + prompt
         processed_prompts.append(prompt)
     request.prompts = processed_prompts
@@ -59,11 +75,18 @@ async def activation_source(
     try:
         logger.info("Processing activations")
         processor = ActivationProcessor()
-        result = processor.process_activations_batch(request, request.prompts)
+        result = await processor.process_activations_batch(request, request.prompts)
         logger.info("Activations result processed successfully")
 
-        return ActivationSourcePost200Response(results=result)
+        return ActivationSourceResponse(results=result)
+    except (BackendUnsupported, NeuronActRangeError) as e:
+        return JSONResponse(content={"error": str(e)}, status_code=400)
     except Exception as e:
+        # An allocation OOM here is retryable and does not poison the CUDA context, so it
+        # gets a 503 and a reclaimed allocator rather than being flattened into a 500 that
+        # leaves the next request to inherit the fragmentation.
+        if recover_from_oom(e):
+            return JSONResponse(content={"error": str(RecoverableOutOfMemory())}, status_code=503)
         logger.error(f"Error processing activations: {str(e)}")
         import traceback
 
@@ -74,11 +97,30 @@ async def activation_source(
         )
 
 
+def top_neurons_per_token(acts: torch.Tensor, layer: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The top ``k`` MLP neurons at each token of ``acts`` ``[seq_len, d_mlp]``.
+
+    Returns ``(values, indices)``: the activation of each kept entry and its
+    ``[token_index, neuron_index]``, in token order. With a neuron activation range table,
+    neurons rank by rarity, because raw scales differ by orders of magnitude. Without one,
+    they rank by absolute value. Entries with a rank of 0 are dropped.
+    """
+    path = Config.get_instance().neuron_act_range_path
+    k = min(k, acts.shape[1])
+    if path:
+        values, top_neuron, rank_key = top_rare_neurons(path, layer, acts, k)
+    else:
+        rank_key, top_neuron = torch.topk(acts.float().abs(), k, dim=1)
+        values = acts.float().gather(1, top_neuron)
+    token = torch.arange(acts.shape[0], device=acts.device).unsqueeze(1).expand_as(top_neuron)
+    keep = rank_key > 0
+    return values[keep], torch.stack((token[keep], top_neuron[keep]), dim=1)
+
+
 class ActivationProcessor:
-    @torch.no_grad()
-    def process_activations_batch(
-        self, request: ActivationSourcePostRequest, prompts: list[str]
-    ) -> list[ActivationSourcePost200ResponseResultsInner]:
+    async def process_activations_batch(
+        self, request: ActivationSourceRequest, prompts: list[str]
+    ) -> list[ActivationSourceResult]:
         """
         Process multiple prompts in parallel using batched GPU operations.
         Returns results in the same order as input prompts.
@@ -92,41 +134,28 @@ class ActivationProcessor:
         all_str_tokens = []
 
         for prompt in prompts:
-            if isinstance(model, StandardizedTransformer):
-                tokens = model.tokenizer(
-                    prompt, add_special_tokens=False, return_tensors="pt"
-                )["input_ids"][0]
-            else:
-                tokens = model.to_tokens(
-                    prompt,
-                    prepend_bos=False,
-                    truncate=False,
-                )[0]
+            tokens = model.to_tokens(
+                prompt,
+                prepend_bos=False,
+                truncate=False,
+            )[0]
 
-            # if prompts is an array of one string, the max is config.token_limit
-            # if prompts is an array of multiple strings, the max is config.token_limit / MAX_BATCH_SIZE
+            # if prompts is an array of one string, the max is config.activation_token_limit
+            # if prompts is an array of multiple strings, the max is config.activation_token_limit / MAX_BATCH_SIZE
             if isinstance(prompts, list) and len(prompts) == 1:
-                batch_token_limit = config.token_limit
+                batch_token_limit = config.activation_token_limit
             else:
-                batch_token_limit = config.token_limit / MAX_BATCH_SIZE
+                batch_token_limit = config.activation_token_limit / MAX_BATCH_SIZE
             if len(tokens) > batch_token_limit:
                 if isinstance(prompts, list) and len(prompts) == 1:
                     raise ValueError(
-                        f"Text too long: {len(tokens)} tokens, max is {config.token_limit} for single string requests"
+                        f"Text too long: {len(tokens)} tokens, max is {config.activation_token_limit} for single string requests"
                     )
                 raise ValueError(
-                    f"Text too long: {len(tokens)} tokens, max is {config.token_limit / MAX_BATCH_SIZE} for batch requests"
+                    f"Text too long: {len(tokens)} tokens, max is {config.activation_token_limit / MAX_BATCH_SIZE} for batch requests"
                 )
 
-            if isinstance(model, StandardizedTransformer):
-                tokenizer = model.tokenizer
-                str_tokens = tokenizer.tokenize(prompt)
-
-                str_tokens = [
-                    tokenizer.convert_tokens_to_string([t]) for t in str_tokens
-                ]
-            else:
-                str_tokens = model.to_str_tokens(prompt, prepend_bos=False)
+            str_tokens = model.to_str_tokens(prompt, prepend_bos=False)
 
             all_tokens.append(tokens)
             all_str_tokens.append(str_tokens)
@@ -136,18 +165,9 @@ class ActivationProcessor:
         batch_size = len(all_tokens)
 
         # Determine pad token
-        if isinstance(model, StandardizedTransformer):
-            pad_token_id = (
-                model.tokenizer.pad_token_id
-                if model.tokenizer.pad_token_id is not None
-                else model.tokenizer.eos_token_id
-            )
-        else:
-            pad_token_id = (
-                model.tokenizer.pad_token_id
-                if model.tokenizer.pad_token_id is not None
-                else model.tokenizer.eos_token_id
-            )
+        pad_token_id = (
+            model.tokenizer.pad_token_id if model.tokenizer.pad_token_id is not None else model.tokenizer.eos_token_id
+        )
 
         # Create padded batch tensor
         padded_tokens = torch.full(
@@ -163,81 +183,54 @@ class ActivationProcessor:
             padded_tokens[i, : len(tokens)] = tokens
             original_lengths.append(len(tokens))
 
-        # Calculate max layer needed
-        max_layer = self._get_layer_num(request.source) + 1
-        if isinstance(model, StandardizedTransformer):
-            if max_layer >= model.num_layers:
-                max_layer = None
-        elif max_layer >= model.cfg.n_layers:
-            max_layer = None
-
-        layer_num = self._get_layer_num(request.source)
         hook_name = sae_manager.get_sae_hook(request.source)
 
-        with torch.no_grad():
-            if isinstance(model, StandardizedTransformer):
-                cache = {}
-                with model.trace(padded_tokens):
-                    if "resid_post" in hook_name:
-                        outputs = nnsight.save(model.layers_output[layer_num])
-                    elif "resid_pre" in hook_name:
-                        if layer_num == 0:
-                            outputs = nnsight.save(model.embeddings_output)
-                        else:
-                            outputs = nnsight.save(model.layers_output[layer_num - 1])
-                    elif "hook_mlp_in" in hook_name:
-                        outputs = nnsight.save(model.mlps_input[layer_num])
-                    else:
-                        raise ValueError(
-                            f"Unsupported hook name for nnsight: {hook_name}"
-                        )
-                    cache[hook_name] = outputs
-            else:
-                if max_layer:
-                    _, cache = model.run_with_cache(
-                        padded_tokens, stop_at_layer=max_layer
-                    )
-                else:
-                    _, cache = model.run_with_cache(padded_tokens)
-
-        activation_data = cache[hook_name].to(Config.get_instance().device)
-        feature_activation_data = (
-            SAEManager.get_instance().get_sae(request.source).encode(activation_data)
-        )
-
-        feature_activation_data = feature_activation_data.float().cpu().numpy()
+        cache = await capture_padded_cache_async(model, padded_tokens, original_lengths, [hook_name])
+        is_neurons = sae_manager.get_sae_type(request.source) == SAE_TYPE.NEURONS
+        # MLP neuron layers have no SAE to load.
+        sae = None if is_neurons else sae_manager.get_sae(request.source)
+        device = Config.get_instance().device
 
         # Convert feature_activation_data to sparse format for all prompts
-        results: list[ActivationSourcePost200ResponseResultsInner] = []
+        results: list[ActivationSourceResult] = []
         for i in range(batch_size):
             seq_len = original_lengths[i]
             str_tokens = all_str_tokens[i]
 
-            # Get activations for this prompt (shape: [seq_len, num_features])
-            prompt_activations = feature_activation_data[i, :seq_len, :]
+            # Encode ONE sequence at a time. `encode` is position-wise, so this is
+            # numerically identical to encoding the padded batch and slicing afterwards, but
+            # peak memory is [seq_len, d_sae] instead of [batch, max_len, d_sae] -- on both
+            # the GPU and (via the host copy below) in RAM. It also skips the padding.
+            with torch.no_grad():
+                activation_data = cache[hook_name][i : i + 1, :seq_len].to(device)
+                if sae is None:
+                    top_k = request.top_k if request.top_k is not None else DEFAULT_NEURON_TOP_K
+                    values, indices = top_neurons_per_token(activation_data[0], int(request.source), top_k)
+                    token_indices = indices[:, 0].cpu().numpy()
+                    feature_indices = indices[:, 1].cpu().numpy()
+                    activation_values = values.float().cpu().numpy()
+                else:
+                    prompt_activations = sae.encode(activation_data)[0].float().cpu().numpy()
+                    nonzero_indices = np.nonzero(prompt_activations)
+                    token_indices = nonzero_indices[0]
+                    feature_indices = nonzero_indices[1]
+                    activation_values = prompt_activations[nonzero_indices]
 
-            # Find non-zero activations
-            nonzero_indices = np.nonzero(prompt_activations)
-            token_indices = nonzero_indices[0]
-            feature_indices = nonzero_indices[1]
-            activation_values = prompt_activations[nonzero_indices]
+            # BOS positions are skipped. With no BOS token (Qwen3), position 0 is a real token.
+            bos_indices = set(bos_positions(all_tokens[i], model.tokenizer.bos_token_id))
 
             # Build sparse dictionary: feature_index -> [[token_index, activation_value], ...]
             active_features: dict[str, list[list[float]]] = {}
-            for token_idx, feature_idx, activation_value in zip(
-                token_indices, feature_indices, activation_values
-            ):
-                if token_idx == 0:
+            for token_idx, feature_idx, activation_value in zip(token_indices, feature_indices, activation_values):
+                if int(token_idx) in bos_indices:
                     continue
                 feature_key = str(int(feature_idx))
                 if feature_key not in active_features:
                     active_features[feature_key] = []
-                active_features[feature_key].append(
-                    [int(token_idx), round(float(activation_value), ROUND_DECIMALS)]
-                )
+                active_features[feature_key].append([int(token_idx), round(float(activation_value), ROUND_DECIMALS)])
 
             results.append(
-                ActivationSourcePost200ResponseResultsInner(
+                ActivationSourceResult(
                     tokens=str_tokens,
                     activeFeatures=active_features,
                 )
@@ -251,17 +244,17 @@ class ActivationProcessor:
         try:
             return int(sae_id.split("-")[0]) if not sae_id.isdigit() else int(sae_id)
 
-        except ValueError:
+        except ValueError as e:
             if "blocks" in sae_id:
                 pattern = r"blocks\.(\d+)\.hook"
                 match = re.search(pattern, sae_id)
                 if match:
                     return int(match.group(1))
-                raise ValueError(f"Can't retrieve layer number from SAE ID: {sae_id}")
+                raise ValueError(f"Can't retrieve layer number from SAE ID: {sae_id}") from e
             if "layer" in sae_id:
                 pattern = r"layer_(\d+)"
                 match = re.search(pattern, sae_id)
                 if match:
                     return int(match.group(1))
-                raise ValueError(f"Can't retrieve layer number from SAE ID: {sae_id}")
-            raise ValueError(f"Can't retrieve layer number from SAE ID: {sae_id}")
+                raise ValueError(f"Can't retrieve layer number from SAE ID: {sae_id}") from e
+            raise ValueError(f"Can't retrieve layer number from SAE ID: {sae_id}") from e

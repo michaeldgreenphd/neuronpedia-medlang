@@ -15,12 +15,16 @@ export default function HeadPageContent({
   initialLayer,
   initialHeadIndex,
   metrics,
+  inferenceEnabled = false,
+  defaultCustomText,
 }: {
   modelId: string;
   modelDisplayName: string;
   initialLayer: number;
   initialHeadIndex: number;
   metrics: ModelHeadMetricsRow[];
+  inferenceEnabled?: boolean;
+  defaultCustomText?: string;
 }) {
   const [head, setHead] = useState({ layer: initialLayer, headIndex: initialHeadIndex });
 
@@ -50,6 +54,8 @@ export default function HeadPageContent({
             initialLayer={initialLayer}
             initialHeadIndex={initialHeadIndex}
             onHeadChange={({ layer, headIndex }) => setHead({ layer, headIndex })}
+            inferenceEnabled={inferenceEnabled}
+            defaultCustomText={defaultCustomText}
           />
         </div>
       </div>

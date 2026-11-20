@@ -1,20 +1,38 @@
-import { REPLACE_MODEL_ID_MAP_FOR_LW_TEMPORARY_REDIRECT } from '@/lib/db/model';
+import { getModelLayerCounts } from '@/lib/db/model';
 import { getNeuronOptimized, neuronExistsAndUserHasAccess } from '@/lib/db/neuron';
 import { makeAuthedUserFromSessionOrReturnNull } from '@/lib/db/user';
+import { userCanAccessModelAndSourceSet } from '@/lib/db/userCanAccess';
+import { COMPARE_PARAM, parseCompareValue } from '@/lib/utils/feature-compare';
+import { emptyNeuron } from '@/lib/utils/neuron-dashboards';
+import { getNeuronLayerTitle, isNeuronInModelRange, isNeuronLayerSource, NEURONS_SOURCESET } from '@/lib/utils/source';
+import { AuthenticatedUser } from '@/lib/with-user';
 import { NeuronWithPartialRelations } from '@/prisma/generated/zod';
 import { Metadata } from 'next';
-import { notFound, redirect } from 'next/navigation';
+import { notFound } from 'next/navigation';
+import FeatureCompare from './feature-compare';
 import FeatureDashboard from './feature-dashboard';
 
-export async function generateMetadata(
-  props: {
-    params: Promise<{ modelId: string; layer: string; index: string }>;
-  }
-): Promise<Metadata> {
+// A neuron page renders without a Neuron row, so a URL past the model's last layer or neuron must be a 404.
+// Otherwise crawlers follow the layer and index links to new pages without end.
+async function neuronPageInModelRange(modelId: string, layer: string, index: string) {
+  const model = await getModelLayerCounts(modelId);
+  return model ? isNeuronInModelRange(model, layer, index) : false;
+}
+
+export async function generateMetadata(props: {
+  params: Promise<{ modelId: string; layer: string; index: string }>;
+}): Promise<Metadata> {
   const params = await props.params;
-  let title = `${params.modelId.toUpperCase()} · ${params.layer.toUpperCase()} · ${params.index.toUpperCase()}`;
-  const feat = await neuronExistsAndUserHasAccess(params.modelId, params.layer, params.index);
-  if (!feat) {
+  const isNeuronLayer = isNeuronLayerSource(params.layer);
+  const layerTitle = isNeuronLayer ? getNeuronLayerTitle(params.layer) : params.layer.toUpperCase();
+  let title = `${params.modelId.toUpperCase()} · ${layerTitle} · ${params.index.toUpperCase()}`;
+  // A neuron layer page renders without a Neuron row, so check the source set instead.
+  const visible =
+    (await neuronExistsAndUserHasAccess(params.modelId, params.layer, params.index)) ||
+    (isNeuronLayer &&
+      (await userCanAccessModelAndSourceSet(params.modelId, NEURONS_SOURCESET, null, true)) &&
+      (await neuronPageInModelRange(params.modelId, params.layer, params.index)));
+  if (!visible) {
     title = '';
   }
   return {
@@ -28,12 +46,31 @@ export async function generateMetadata(
   };
 }
 
-export default async function Page(
-  props: {
-    params: Promise<{ modelId: string; layer: string; index: string }>;
-    searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
+// Returns null when the feature does not exist or the user cannot see it.
+async function loadNeuron(
+  modelId: string,
+  layer: string,
+  index: string,
+  user: AuthenticatedUser | null,
+): Promise<NeuronWithPartialRelations | null> {
+  try {
+    const neuron = await getNeuronOptimized(modelId, layer, index, user);
+    if (neuron) {
+      return neuron;
+    }
+    // A neuron layer page renders without a Neuron row.
+    return isNeuronLayerSource(layer) && (await neuronPageInModelRange(modelId, layer, index))
+      ? emptyNeuron(modelId, layer, index, NEURONS_SOURCESET)
+      : null;
+  } catch (e) {
+    return null;
   }
-) {
+}
+
+export default async function Page(props: {
+  params: Promise<{ modelId: string; layer: string; index: string }>;
+  searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
+}) {
   const searchParams = await props.searchParams;
   const params = await props.params;
   const embed = searchParams.embed === 'true';
@@ -45,80 +82,20 @@ export default async function Page(
   const embedSteer = searchParams.embedsteer !== 'false'; // default embed steer
   const embedTestField = searchParams.embedtestfield !== 'false'; // default embed test field
   const defaultTestText = searchParams.defaulttesttext ? (searchParams.defaulttesttext as string) : undefined;
+  const tokenList = typeof searchParams.tokenlist === 'string' ? searchParams.tokenlist : undefined; // TOKEN_LIST_PARAM
 
-  // TODO: this is a temporary map since there is a bug in our lesswrong plugin that breaks when dots are in modelIds for hoverover links
-  if (params.modelId in REPLACE_MODEL_ID_MAP_FOR_LW_TEMPORARY_REDIRECT) {
-    const redirectToSteer = searchParams.redirectToSteer === 'true';
-    if (redirectToSteer) {
-      const strength = searchParams.strength ? (searchParams.strength as string) : 10;
-      const steerId = searchParams.saved ? (searchParams.saved as string) : null;
-      const redirectUrl = `/${REPLACE_MODEL_ID_MAP_FOR_LW_TEMPORARY_REDIRECT[params.modelId as keyof typeof REPLACE_MODEL_ID_MAP_FOR_LW_TEMPORARY_REDIRECT]}/steer?embed=true&source=${params.layer}&index=${params.index}&hideInitialSettingsOnMobile=true&strength=${strength}${steerId ? `&saved=${steerId}` : ''}`;
-      redirect(redirectUrl);
-    } else {
-      const queryString = new URLSearchParams(searchParams as Record<string, string>).toString();
-      const redirectUrl = `/${REPLACE_MODEL_ID_MAP_FOR_LW_TEMPORARY_REDIRECT[params.modelId as keyof typeof REPLACE_MODEL_ID_MAP_FOR_LW_TEMPORARY_REDIRECT]}/${params.layer}/${params.index}${queryString ? `?${queryString}` : ''}`;
-      redirect(redirectUrl);
-    }
+  const compareId = embed ? null : parseCompareValue(searchParams[COMPARE_PARAM]);
+  const user = await makeAuthedUserFromSessionOrReturnNull();
+  const [neuron, compareNeuron] = await Promise.all([
+    loadNeuron(params.modelId, params.layer, params.index, user),
+    compareId ? loadNeuron(compareId.modelId, compareId.layer, compareId.index, user) : null,
+  ]);
+  if (!neuron) {
+    notFound();
   }
 
-  const { modelId } = params;
-  let neuron: NeuronWithPartialRelations | null = null;
-
-  try {
-    neuron = await getNeuronOptimized(
-      modelId,
-      params.layer,
-      params.index,
-      await makeAuthedUserFromSessionOrReturnNull(),
-    );
-
-    if (!neuron) {
-      if (params.layer.match(/^-?\d+$/)) {
-        neuron = {
-          modelId,
-          layer: params.layer,
-          index: params.index,
-          sourceSetName: 'neurons',
-          creatorId: '',
-          createdAt: new Date(),
-          maxActApprox: 0.01,
-          neuron_alignment_indices: [],
-          neuron_alignment_values: [],
-          neuron_alignment_l1: [],
-          correlated_neurons_indices: [],
-          correlated_neurons_pearson: [],
-          correlated_neurons_l1: [],
-          correlated_features_indices: [],
-          correlated_features_pearson: [],
-          correlated_features_l1: [],
-          neg_str: [],
-          neg_values: [],
-          pos_str: [],
-          pos_values: [],
-          frac_nonzero: 0,
-          freq_hist_data_bar_heights: [],
-          freq_hist_data_bar_values: [],
-          logits_hist_data_bar_heights: [],
-          logits_hist_data_bar_values: [],
-          decoder_weights_dist: [],
-          umap_cluster: null,
-          umap_log_feature_sparsity: null,
-          umap_x: null,
-          umap_y: null,
-          topkCosSimIndices: [],
-          topkCosSimValues: [],
-          vector: [],
-          hasVector: false,
-          vectorDefaultSteerStrength: null,
-          hookName: null,
-          vectorLabel: null,
-        };
-      } else {
-        notFound();
-      }
-    }
-  } catch (e) {
-    notFound();
+  if (compareId) {
+    return <FeatureCompare leftNeuron={neuron} rightNeuron={compareNeuron} rightId={compareId} />;
   }
 
   return (
@@ -134,6 +111,8 @@ export default async function Page(
         embedActivations={embedActivations}
         embedLink={embedLink}
         embedSteer={embedSteer}
+        initialTokenList={tokenList}
+        syncTokenListToUrl
       />
     </div>
   );

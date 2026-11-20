@@ -52,7 +52,7 @@ const NLA_MODEL_TOGGLE_OPTIONS = [
               <strong>Verbalizer:</strong> <code>fp8-quantized</code>
             </li>
             <li>
-              <strong>Reconstructor*:</strong> <code>fp8-quantized</code>
+              <strong>Reconstructor*:</strong> <code>int4-quantized</code>
             </li>
           </ul>
         </p>
@@ -104,6 +104,53 @@ const NLA_MODEL_TOGGLE_OPTIONS = [
       </div>
     ),
   },
+  {
+    modelId: 'qwen2.5-1.5b-it',
+    displayName: 'Qwen 1.5B',
+    layer: 18,
+    url: '/qwen2.5-1.5b-it/nla',
+    hoverInfo: (
+      <div className="flex flex-col gap-y-1.5">
+        <p>
+          <strong>Model:</strong> <code>Qwen 2.5 1.5B Instruct</code>
+        </p>
+        <p>
+          <strong>Activation Verbalizer:</strong>{' '}
+          <a
+            href="https://huggingface.co/dormantx/Qwen2.5-1.5B-Instruct-NLA-L18-av"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <code className="text-sky-600 hover:underline">dormantx/Qwen2.5-1.5B-Instruct-NLA-L18-av</code>
+          </a>
+        </p>
+        <p>
+          <strong>Activation Reconstructor:</strong>{' '}
+          <a
+            href="https://huggingface.co/dormantx/Qwen2.5-1.5B-Instruct-NLA-L18-ar"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <code className="text-sky-600 hover:underline">dormantx/Qwen2.5-1.5B-Instruct-NLA-L18-ar</code>
+          </a>
+        </p>
+        <p className="flex flex-col gap-y-1">
+          <strong>Deployment</strong>
+          <ul className="ml-4 list-inside list-disc">
+            <li>
+              <strong>Source Model:</strong> <code>bfloat16</code>
+            </li>
+            <li>
+              <strong>Verbalizer:</strong> <code>bfloat16</code>
+            </li>
+            <li>
+              <strong>Reconstructor*:</strong> <code>bfloat16</code>
+            </li>
+          </ul>
+        </p>
+      </div>
+    ),
+  },
 ] as const;
 
 export default function NLAExplainer() {
@@ -116,7 +163,6 @@ export default function NLAExplainer() {
     isHydratingDemo,
     isEditingMessage,
     chatMessages,
-    tokenizerFormat,
     activeDemoCacheId,
     handleClear,
     loadCacheById,
@@ -146,7 +192,7 @@ export default function NLAExplainer() {
   // so loading a new demo can't clobber the working edit state.
   const isBusy = isChatStreaming || isLoading || isHydratingDemo || isEditingMessage;
 
-  const startTour = useNlaTour({
+  const { startTour, isTourActive } = useNlaTour({
     selectedModelId,
     handleModelChange,
     loadCacheById,
@@ -168,11 +214,10 @@ export default function NLAExplainer() {
     startTour();
   };
 
-  // Auto-start the tour for first-time visitors. Skipped when the user
-  // is deep-linking to a saved cache (`?id=...`), inside an embed, or
-  // on a small viewport where the spotlight popovers don't fit. On
-  // subsequent visits we just sync `hasSeenTour` from localStorage so
-  // the Guide button can hide its "new" indicator.
+  // Auto-start the tour for first-time visitors, including on mobile.
+  // Skipped when the user is deep-linking to a saved cache (`?id=...`)
+  // or inside an embed. On subsequent visits we just sync `hasSeenTour`
+  // from localStorage so the Guide button can hide its "new" indicator.
   useEffect(() => {
     try {
       const seen = localStorage.getItem(NLA_TOUR_SEEN_KEY) === 'true';
@@ -180,7 +225,6 @@ export default function NLAExplainer() {
       if (seen) return;
       if (isEmbed) return;
       if (initialCacheId) return;
-      if (typeof window !== 'undefined' && window.innerWidth < 640) return;
       markTourSeen();
       startTour();
     } catch (error) {
@@ -209,12 +253,13 @@ export default function NLAExplainer() {
               />
             )}
           </button>
-          <div className="absolute left-1/2 top-1 -ml-6 flex w-64 -translate-x-1/2 flex-col items-center justify-center gap-y-0 sm:relative sm:left-0 sm:ml-0 sm:w-full sm:translate-x-0 sm:items-start">
+          <div className="absolute left-1/2 top-1 -ml-12 flex w-64 -translate-x-1/2 flex-col items-center justify-center gap-y-0 sm:relative sm:left-0 sm:ml-0 sm:w-full sm:translate-x-0 sm:items-start">
             <div
               className="whitespace-nowrap text-[11px] font-semibold leading-none text-slate-800 sm:-mt-2 sm:mb-0.5 sm:text-base"
               id="chat"
             >
-              Natural Language Autoencoders
+              <span className="sm:hidden">NLAs</span>
+              <span className="hidden sm:inline">Natural Language Autoencoders</span>
             </div>
             <CustomTooltip
               wide
@@ -448,7 +493,11 @@ export default function NLAExplainer() {
         <div className="flex min-h-0 w-full min-w-0 flex-1 flex-col gap-y-1">
           <div className={`${isEmbed ? 'mt-0' : 'sm:mt-2'} flex min-h-0 min-w-0 flex-1 flex-col gap-y-1`}>
             <div className="flex min-h-0 w-full min-w-0 flex-1 flex-col gap-y-1 sm:flex-row sm:gap-x-5">
-              <div className="flex min-h-0 min-w-0 flex-[0.7] basis-0 flex-col overflow-x-hidden sm:flex-1">
+              <div
+                className={`flex min-h-0 min-w-0 basis-0 flex-col overflow-x-hidden sm:flex-1 ${
+                  isTourActive ? 'flex-[1.5]' : 'flex-[0.7]'
+                }`}
+              >
                 <NLAInputChat />
               </div>
               <div id={NLA_DETAILS_ELEMENT_ID} className="flex min-h-0 min-w-0 flex-1 basis-0 flex-col sm:max-w-sm">
@@ -463,7 +512,9 @@ export default function NLAExplainer() {
               </div>
             </div>
             {(() => {
-              const len = tokenizerFormat.formatChat(chatMessages).length;
+              // Approximate length by the sum of message contents (the exact
+              // rendered length is enforced server-side after templating).
+              const len = chatMessages.reduce((sum, m) => sum + m.content.length, 0);
               return len > MAX_TEXT_LENGTH ? (
                 <span className="text-xs text-red-500">
                   Text must be {MAX_TEXT_LENGTH} characters or less (currently {len})

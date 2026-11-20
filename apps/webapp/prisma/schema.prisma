@@ -53,6 +53,12 @@ model Session {
   @@index([userId])
 }
 
+// Same values as the SES suppression list reasons.
+enum EmailSuppressionReason {
+  BOUNCE
+  COMPLAINT
+}
+
 enum UserSecretType {
   NEURONPEDIA
   OPENAI
@@ -94,8 +100,10 @@ model User {
   admin                        Boolean                       @default(false)
   accounts                     Account[]
   explanations                 Explanation[]
+  tokenLists                   NeuronTokenList[]
   triggeredExplanations        Explanation[]                 @relation(name: "triggeredByUser")
   canTriggerExplanations       Boolean                       @default(false)
+  canUploadExplanations        Boolean                       @default(false)
   neurons                      Neuron[]
   sources                      Source[]
   sourceSets                   SourceSet[]
@@ -118,9 +126,13 @@ model User {
   graphMetadatas               GraphMetadata[]
   graphMetadataDataPutRequests GraphMetadataDataPutRequest[]
   graphMetadataSubgraphs       GraphMetadataSubgraph[]
+  jlensShares                  JlensShare[]
+  jlensSharePutRequests        JlensSharePutRequest[]
 
-  samples Sample[]
-  probes  Probe[]
+  samples    Sample[]
+  probes     Probe[]
+  vectors    Vector[]
+  vectorTags VectorTag[]
 
   isProblemEditor      Boolean              @default(false)
   problemNodesCreated  ProblemNode[]        @relation(name: "problemNodeCreatedBy")
@@ -133,6 +145,9 @@ model User {
   emailNewsletterNotification Boolean @default(true)
   emailUnsubscribeAll         Boolean @default(false)
   emailUnsubscribeCode        String  @default(cuid())
+  // Set from the SES suppression list. A suppressed user also has emailUnsubscribeAll = true.
+  emailSuppressedReason       EmailSuppressionReason?
+  emailSuppressedAt           DateTime?
 
   createdAt DateTime @default(now())
 
@@ -209,6 +224,90 @@ model GraphMetadataDataPutRequest {
   @@index([userId])
 }
 
+// A shared jlens (Jacobian Lens) chat/completion run. The heavy data (messages,
+// meta, and the full unfiltered per-position token stream) is stored gzipped in
+// S3 at `url`; the small UI-restore state lives in columns here so a shared link
+// can be looked up and rehydrated without parsing the S3 blob.
+model JlensShare {
+  id String @id @default(cuid())
+
+  // 'chat' | 'completion' (matches the export discriminator)
+  kind String
+
+  modelId String
+  model   Model  @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  // Full URL of the gzipped JSON file stored in S3.
+  url String
+
+  description String?
+
+  // Sidebar predicted-token selections: [{ key: string, type: LensType }].
+  lockedTokens        Json     @default("[]")
+  // Selected chat token positions (indices into the token stream).
+  selectedPositions   Int[]    @default([])
+  // Lens columns shown on load, in display order: 'JACOBIAN_LENS' | 'ORACLE_LENS' | 'LOGIT_LENS'.
+  lensColumns         String[] @default([])
+  // Legacy lens tab: 'JACOBIAN_LENS' | 'LOGIT_LENS' | 'DIFF'. Read only when `lensColumns` is empty.
+  activeLensModeTab   String
+  topN                Int
+  hideNonWordTokens   Boolean  @default(true)
+  // Run settings, restored on load (the same values the advanced panel + steer
+  // panel control). Defaulted so pre-existing shares migrate cleanly.
+  temperature         Float    @default(0)
+  numCompletionTokens Int      @default(256)
+
+  // Optional steered run saved with this share. The heavy steered token stream
+  // + meta live in the S3 blob alongside the main run; these columns hold the
+  // small config used to re-run / re-enter steer mode. Null when the share has
+  // no active steered run.
+  // Exact decoded token string being steered (e.g. " cat").
+  steerToken     String?
+  // Lens type of the steered readout: 'JACOBIAN_LENS' | 'LOGIT_LENS'.
+  steerType      String?
+  // Model layer numbers the steer was injected at.
+  steerLayers    Int[]    @default([])
+  // Signed steer strength (negative suppresses the readout).
+  steerStrength  Float?
+  // When true, the steer ablates (projects out) the readout direction instead
+  // of additively steering — mutually exclusive with steerStrength.
+  steerAblate    Boolean?
+  // Intervention mode: 'steer' (add/suppress) or 'swap' (replace the source
+  // readout with `swapToken`). Null for pre-swap shares.
+  steerMode      String?
+  // The target token for a swap (e.g. " Rugby"). Null for plain steers.
+  swapToken      String?
+  // Whether the steer/swap intervention was applied to generated tokens too.
+  steerGenerated Boolean?
+
+  numPromptTokens Int?
+
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([modelId])
+  @@index([userId])
+}
+
+model JlensSharePutRequest {
+  id String @id @default(cuid())
+
+  ipAddress String
+  filename  String
+  url       String
+
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([ipAddress])
+  @@index([userId])
+}
+
 model ListComment {
   id     String @id @default(cuid())
   listId String
@@ -274,6 +373,18 @@ model VerificationToken {
   @@unique([identifier, token])
 }
 
+// One row for each sign-in (magic link) email that we send. It sets the per-inbox and site-wide limits.
+// `toKey` is the inbox key: lowercase, no "+tag", and no dots for Gmail.
+model SignInEmailLog {
+  id     String   @id @default(cuid())
+  to     String
+  toKey  String
+  sentAt DateTime @default(now())
+
+  @@index([toKey, sentAt])
+  @@index([sentAt])
+}
+
 model Model {
   /// @zod.custom.use(z.string().regex(new RegExp(/^[a-zA-Z0-9-_]+$/), "Name should contain only numbers, letters, underscores, or dashes",).min(1).max(128).transform((val) => val.toLowerCase()))
   id               String @id
@@ -283,6 +394,16 @@ model Model {
 
   tlensId      String?
   openRouterId String?
+  // The HuggingFace repo id this model corresponds to, when it has one. Null is a real answer, not
+  // a gap to backfill: a model supplied locally is not on the Hub, and still gets a Neuronpedia id,
+  // a URL and sources like any other row. Postgres does not collide nulls in a unique index, so any
+  // number of rows may be null while every non-null value stays distinct.
+  //
+  // Unique, so a repo id resolves to one model and the lookup by it can return a single row. Note
+  // this is a rule about what a model row *is*, not one about weights: a row names the weights it
+  // serves, so a variant that runs a different repo's weights against these SAEs is its own row
+  // with its own repo id, and never a second row pointing here.
+  hfRepoId     String? @unique
   dimension    Int?
   thinking     Boolean @default(false)
 
@@ -300,32 +421,33 @@ model Model {
   instruct         Boolean @default(false)
 
   /// @zod.number.int().min(0)
-  layers               Int
+  layers           Int
   /// @zod.number.int().min(0)
-  neuronsPerLayer      Int
-  createdAt            DateTime              @default(now())
+  neuronsPerLayer  Int
+  createdAt        DateTime            @default(now())
   /// @zod.custom.use(z.string().trim().min(1))
-  owner                String
-  updatedAt            DateTime              @default(now()) @updatedAt
+  owner            String
+  updatedAt        DateTime            @default(now()) @updatedAt
   /// @zod.string.url()
-  website              String?
-  explanations         Explanation[]
-  creator              User                  @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-  neurons              Neuron[]
-  savedSearches        SavedSearch[]
-  sourceSets           SourceSet[]
-  steerOutputs         SteerOutput[]
-  evals                Eval[]
-  sourceInferenceHosts InferenceHostSource[]
-  graphHostSources     GraphHostSource[]
-  graphMetadata        GraphMetadata[]
-  nlaSources           NlaSource[]
-  nlaExplainCaches     NlaExplainCache[]
-  headMetrics          ModelHeadMetrics[]
-  headSequences        ModelHeadSequence[]
+  website          String?
+  explanations     Explanation[]
+  creator          User                @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  neurons          Neuron[]
+  savedSearches    SavedSearch[]
+  sourceSets       SourceSet[]
+  steerOutputs     SteerOutput[]
+  evals            Eval[]
+  computeHosts     ComputeHost[]
+  graphMetadata    GraphMetadata[]
+  jlensShares      JlensShare[]
+  nlaSources       NlaSource[]
+  nlaExplainCaches NlaExplainCache[]
+  headMetrics      ModelHeadMetrics[]
+  headSequences    ModelHeadSequence[]
 
   samples Sample[]
   probes  Probe[]
+  vectors Vector[]
 
   @@unique([defaultSourceSetName, id])
   @@unique([defaultSourceId, id])
@@ -399,73 +521,89 @@ model ModelHeadSequence {
   @@index([modelId, datasetName, nSequences, dtype, attnImplementation], name: "ModelHeadSequence_runConfigKey_idx")
 }
 
-model GraphHostSource {
-  id                  String  @id @default(cuid())
-  name                String
-  hostUrl             String?
-  runpodServerlessUrl String?
-
-  modelId String
-  model   Model  @relation(fields: [modelId], references: [id], onDelete: Cascade)
-
-  sourceSets GraphHostSourceOnSourceSet[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([modelId])
+// Which support server a ComputeHost runs. One machine running two services is
+// two rows.
+enum ComputeService {
+  INFERENCE
+  GRAPH
+  NLA
+  AUTOINTERP
+  SPARSITY
 }
 
-model GraphHostSourceOnSourceSet {
-  sourceSetName    String
-  sourceSetModelId String
-  sourceSet        SourceSet @relation(fields: [sourceSetName, sourceSetModelId], references: [name, modelId], onDelete: Cascade)
+// Routing registry for the GPU support servers. Rows are written by the deploy
+// tool at pod-up and pod-down, never by the pods themselves.
+model ComputeHost {
+  id String @id @default(cuid())
 
-  graphHostSourceId String
-  graphHostSource   GraphHostSource @relation(fields: [graphHostSourceId], references: [id], onDelete: Cascade)
+  // Fleet profile that launched this host, e.g. "inference-gemma-2-2b-a".
+  name String
 
-  @@id([sourceSetName, sourceSetModelId, graphHostSourceId])
-  @@index([sourceSetModelId])
-  @@index([sourceSetModelId, sourceSetName])
-}
-
-enum InferenceEngine {
-  TRANSFORMER_LENS
-  NNSIGHT
-  CSPACE
-}
-
-model InferenceHostSource {
-  id      String          @id @default(cuid())
-  name    String
+  // Base URL, no trailing slash. The resolver appends the path.
   hostUrl String
-  engine  InferenceEngine @default(TRANSFORMER_LENS)
+
+  service ComputeService
+
+  // A row means "ready to serve": the deploy tool registers once the model is
+  // loaded and deletes the row to stop traffic. There is no health state here
+  // either -- a not-yet-ready host is indistinguishable from an absent one, and
+  // liveness is discovered by making the request and failing over.
+  //
+  // "runpod" | "local-ssh". Tells the reaper which provider client to use.
+  provider String?
+
+  // Provider-side instance id. Required for automated teardown.
+  providerRef String?
 
   modelId String
   model   Model  @relation(fields: [modelId], references: [id], onDelete: Cascade)
 
-  sources InferenceHostSourceOnSource[]
+  // For INFERENCE. Empty means the host serves any request for the model
+  // (jlens, steering, assistant axis).
+  sources ComputeHostOnSource[]
 
-  runpodServerlessUrl String?
+  // For GRAPH.
+  sourceSets ComputeHostOnSourceSet[]
+
+  // For NLA, and only for NLA. An NLA process bakes its verbalizer,
+  // reconstructor and extraction layer into startup config, and no request
+  // field can select another, so a host serves exactly one NlaSource -- a
+  // column, not a join table. A CHECK constraint ties it to service = NLA.
+  nlaSourceId String?
+  nlaSource   NlaSource? @relation(fields: [modelId, nlaSourceId], references: [modelId, id], onDelete: Cascade)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  @@index([modelId])
-  @@index([engine])
+  // Re-registration upserts rather than duplicating on pod restart.
+  @@unique([hostUrl, service])
+  @@index([service, modelId])
 }
 
-model InferenceHostSourceOnSource {
+model ComputeHostOnSource {
   sourceId      String
   sourceModelId String
   source        Source @relation(fields: [sourceId, sourceModelId], references: [id, modelId], onDelete: Cascade)
 
-  inferenceHostId String
-  inferenceHost   InferenceHostSource @relation(fields: [inferenceHostId], references: [id], onDelete: Cascade)
+  computeHostId String
+  computeHost   ComputeHost @relation(fields: [computeHostId], references: [id], onDelete: Cascade)
 
-  @@id([sourceId, sourceModelId, inferenceHostId])
+  @@id([sourceId, sourceModelId, computeHostId])
   @@index([sourceModelId])
   @@index([sourceModelId, sourceId])
+}
+
+model ComputeHostOnSourceSet {
+  sourceSetName    String
+  sourceSetModelId String
+  sourceSet        SourceSet @relation(fields: [sourceSetName, sourceSetModelId], references: [name, modelId], onDelete: Cascade)
+
+  computeHostId String
+  computeHost   ComputeHost @relation(fields: [computeHostId], references: [id], onDelete: Cascade)
+
+  @@id([sourceSetName, sourceSetModelId, computeHostId])
+  @@index([sourceSetModelId])
+  @@index([sourceSetModelId, sourceSetName])
 }
 
 model Source {
@@ -474,8 +612,8 @@ model Source {
 
   hasDashboards Boolean @default(true)
 
-  inferenceEnabled Boolean                       @default(false)
-  inferenceHosts   InferenceHostSourceOnSource[]
+  inferenceEnabled Boolean               @default(false)
+  computeHosts     ComputeHostOnSource[]
 
   saelensConfig  Json?
   saelensRelease String?
@@ -542,10 +680,10 @@ model SourceSet {
   releases     SourceRelease? @relation(fields: [releaseName], references: [name], onDelete: Cascade)
 
   // we may have graphs even if we are not actively allowing generation of new graphs for this sourceSet
-  hasGraphs        Boolean                      @default(false)
-  graphEnabled     Boolean                      @default(false)
-  graphHostSources GraphHostSourceOnSourceSet[]
-  graphMetadata    GraphMetadata[]
+  hasGraphs     Boolean                  @default(false)
+  graphEnabled  Boolean                  @default(false)
+  computeHosts  ComputeHostOnSourceSet[]
+  graphMetadata GraphMetadata[]
 
   similarityMatrixEnabled Boolean @default(false)
 
@@ -564,6 +702,10 @@ model SourceSet {
   showCorrelated      Boolean @default(false)
   showHeadAttribution Boolean @default(false)
   showUmap            Boolean @default(false)
+
+  // base URL of dashboard files outside the database, eg https://dashboards.neuronpedia.org/v1/qwen3-32b
+  // when set, the browser reads each feature's dashboard from it (see lib/utils/neuron-dashboards.ts)
+  externalDashboardsUrl String?
 
   createdAt DateTime @default(now())
 
@@ -659,6 +801,7 @@ model Neuron {
   createdAt     DateTime              @default(now())
   activations   Activation[]
   explanations  Explanation[]
+  tokenLists    NeuronTokenList[]
   comments      Comment[]
   bookmarks     Bookmark[]
   model         Model                 @relation(fields: [modelId], references: [id], onDelete: Cascade)
@@ -744,6 +887,20 @@ model Explanation {
 
   scores ExplanationScore[]
 
+  // Null means POSITIVE.
+  pole          ExplanationPole?
+  // Null means ACTIVATION.
+  aspect        ExplanationAspect?
+  // Signed, in the units that the explanation type states.
+  steerStrength Float?
+
+  // For explanations from another site: the page for this unit, and who wrote it there.
+  sourceUrl       String?
+  contributorName String?
+  contributorUrl  String?
+  // Fields that only one source has, for example a persona name or tags.
+  metadata        Json?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @default(now()) @updatedAt
 
@@ -761,6 +918,19 @@ model Explanation {
   @@index([typeName, explanationModelName])
   @@index([embedding], map: "Explanation_embedding_idx")
   @@index([embedding], map: "idx_explanation_embedding_null")
+}
+
+// Which sign of the activation an explanation describes.
+enum ExplanationPole {
+  POSITIVE
+  NEGATIVE
+  BOTH
+}
+
+// ACTIVATION: what makes the unit fire. STEERING: what the model does when the unit is pushed.
+enum ExplanationAspect {
+  ACTIVATION
+  STEERING
 }
 
 model ExplanationModelSettings {
@@ -812,11 +982,47 @@ model ExplanationType {
   creatorId String
   creator   User   @relation(fields: [creatorId], references: [id], onDelete: Cascade)
 
+  license    String?
+  licenseUrl String?
+  citation   String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @default(now()) @updatedAt
 
   explanations Explanation[]
+  tokenLists   NeuronTokenList[]
 
+  @@index([creatorId])
+}
+
+// A ranked list of tokens or short strings with scores, for one pole of a neuron, for example a lens read.
+// The type gives the credit. The name tells the lists of one type apart, for example "Output Read".
+model NeuronTokenList {
+  id      String @id @default(cuid())
+  modelId String
+  layer   String
+  index   String
+  neuron  Neuron @relation(fields: [modelId, layer, index], references: [modelId, layer, index], onDelete: Cascade)
+
+  typeName  String
+  type      ExplanationType @relation(fields: [typeName], references: [name], onDelete: Cascade)
+  creatorId String
+  creator   User            @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  name     String
+  pole     ExplanationPole
+  // ACTIVATION: what drives the pole. STEERING: what the pole writes.
+  aspect   ExplanationAspect
+  tokens   String[]
+  // Same order as tokens. Empty when the source gives only a ranking.
+  values   Float[]           @db.Real
+  metadata Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+
+  @@unique([modelId, layer, index, typeName, name, pole])
+  @@index([typeName])
   @@index([creatorId])
 }
 
@@ -1056,7 +1262,9 @@ model SteerOutput {
   toNeurons                SteerOutputToNeuron[] // features used in this steer output
   temperature              Float
   numTokens                Int
+  // No backend applies this; kept for the rows that were keyed on it.
   freqPenalty              Float
+  presencePenalty          Float                 @default(0)
   seed                     Float
   strengthMultiplier       Float
   steerMethod              String                @default("SIMPLE_ADDITIVE")
@@ -1080,11 +1288,11 @@ model SteerOutput {
   capMonitorOutput String?
 
   // to do lookups, we should also check Neurons to ensure they match
-  @@index([modelId, type, inputTextMd5, temperature, numTokens, freqPenalty, seed, strengthMultiplier, version, steerSpecialTokens, steerMethod], name: "steerIndex")
-  @@index([modelId, type, inputTextChatTemplateMd5, temperature, numTokens, freqPenalty, seed, strengthMultiplier, version, steerSpecialTokens, steerMethod], name: "steerIndex2")
+  @@index([modelId, type, inputTextMd5, temperature, numTokens, presencePenalty, seed, strengthMultiplier, version, steerSpecialTokens, steerMethod], name: "steerIndex")
+  @@index([modelId, type, inputTextChatTemplateMd5, temperature, numTokens, presencePenalty, seed, strengthMultiplier, version, steerSpecialTokens, steerMethod], name: "steerIndex2")
   // quicker lookup without the type
-  @@index([modelId, inputTextMd5, temperature, numTokens, freqPenalty, seed, strengthMultiplier, version, steerSpecialTokens, steerMethod], name: "steerIndexWithoutType")
-  @@index([modelId, inputTextChatTemplateMd5, temperature, numTokens, freqPenalty, seed, strengthMultiplier, version, steerSpecialTokens, steerMethod], name: "steerIndexWithoutType2")
+  @@index([modelId, inputTextMd5, temperature, numTokens, presencePenalty, seed, strengthMultiplier, version, steerSpecialTokens, steerMethod], name: "steerIndexWithoutType")
+  @@index([modelId, inputTextChatTemplateMd5, temperature, numTokens, presencePenalty, seed, strengthMultiplier, version, steerSpecialTokens, steerMethod], name: "steerIndexWithoutType2")
 }
 
 enum SteerOutputType {
@@ -1213,16 +1421,16 @@ model NlaSource {
   modelId String
   model   Model  @relation(fields: [modelId], references: [id], onDelete: Cascade)
 
-  displayName String   @default("")
-  description String   @default("")
-  url         String   @default("")
-  author      String   @default("")
+  displayName String @default("")
+  description String @default("")
+  url         String @default("")
+  author      String @default("")
   av          String
   ar          String
   layerNum    Int
-  servers     String[]
-  norm        Float    @default(0.0)
+  norm        Float  @default(0.0)
 
+  computeHosts  ComputeHost[]
   cachedEntries NlaExplainCache[]
   createdAt     DateTime          @default(now())
 
@@ -1340,8 +1548,10 @@ model Sample {
   conversationTokenizedStr String[]
   finalResponseStartIndex  Int
 
-  // HNSW index managed manually via SQL (Prisma can't create pgvector indexes):
-  //   CREATE INDEX "Sample_conversationEmbedding_idx" ON "Sample" USING hnsw ("conversationEmbedding" vector_cosine_ops);
+  // Written and read by nothing today, and deliberately unindexed. Add an HNSW
+  // index in a migration before using it for similarity search -- pgvector
+  // cannot answer a `<=>` query without one, and `prisma db push` deletes any
+  // index the schema does not declare.
   conversationEmbedding Unsupported("vector(256)")?
 
   userId    String
@@ -1432,4 +1642,154 @@ model ProcessLock {
   startedAt DateTime @default(now())
   expiresAt DateTime // is ignorable/deleted after expiresAt
   details   Json?
+}
+
+// ── Vectors ───────────────────────────────────────────────────────────
+
+// A label a vector can carry: what it is for, what it was fitted on, whatever a reader would sort a
+// list by. `axis`, `probe`, `steer` are the first three.
+//
+// Nothing gates a read on a tag. Every vector projects the same way, so a probe reads just as well
+// as an axis, and refusing one would be a display convention withholding a number that is perfectly
+// well defined. A tag says what a vector is for; it is not a permission, and the arithmetic is
+// `projectionParams` alone.
+//
+// Rows rather than enum members, so each tag carries its own description and a new one is an insert
+// rather than a migration plus a deploy. Only an admin writes one today, by hand; letting a user
+// coin a tag is why this is a table, and is work for later.
+model VectorTag {
+  // What a query and a URL name this by: lowercase, hyphenated where it needs to be. Every tag sits
+  // on a vector, so it does not say so itself: `steer`, not `steering-vector`.
+  name String @id
+
+  // What a page shows, and what the tag means where a reader is choosing between tags. A tag
+  // nobody can define is one nobody applies consistently, so the description is not optional.
+  displayName String
+  description String
+
+  // Who coined it, once a person can. Null for the tags seeded with the table, because nobody
+  // claimed those and crediting whoever applied the migration would be a fiction. Kept on the
+  // user's deletion rather than cascading: other people's vectors wear this tag, and the vectors
+  // would outlive their labelling.
+  creatorId String?
+  creator   User?   @relation(fields: [creatorId], references: [id], onDelete: SetNull)
+
+  vectors VectorTagOnVector[]
+
+  createdAt DateTime @default(now())
+}
+
+// Which tags a vector carries.
+//
+// A join table rather than a list of strings on `Vector`, so a tag has exactly one definition and
+// renaming or describing it is one write rather than a scan.
+model VectorTagOnVector {
+  vectorId String
+  vector   Vector @relation(fields: [vectorId], references: [id], onDelete: Cascade)
+
+  tagName String
+  tag     VectorTag @relation(fields: [tagName], references: [name], onDelete: Cascade)
+
+  addedAt DateTime @default(now())
+
+  @@id([vectorId, tagName])
+  @@index([tagName])
+}
+
+// One stored vector in a model's activation space, with the parameters that turn an activation into
+// a reading. Sent to inference with the request, so a new vector is a row here rather than a deploy
+// of the serving pod. Distinct from `Neuron`, which addresses weights living in an SAE or a
+// transcoder; this holds the numbers themselves.
+//
+// One row is one reading: a fit with several independent components is several rows, while a probe
+// summing across layers is one row with several `layers`. Which pole is the preferable one is
+// deliberately not recorded -- that is an editorial call for whatever displays the reading.
+//
+// The projection, and where each part of a row lands in it:
+//
+//   h          = activations pooled as params.read says, at the one entry in `layers`
+//   x          = h - params.preNormMean
+//   x          = x / ||x||                    (only when params.normalize is "l2")
+//   raw        = dot(x - params.postNormMean, values)
+//   value      = (raw - params.center) / (raw >= center ? params.scalePos : params.scaleNeg)
+//   percentile = interpolated against params.quantilesPos/quantilesNeg, bounded to [-1, 1]
+//
+// where `params` is `projectionParams`. `value` is never clipped: a reading past 1 says the vector
+// is being read off the distribution it was fitted on, which is a signal rather than a boundary.
+//
+// `params.read` is what makes a reading reproducible: which point is captured, which tokens are
+// selected and how they are pooled. Fitting on one rule and reading on another returns a plausible
+// number rather than an error, so the rule belongs with the numbers rather than in serving code.
+model Vector {
+  id      String @id @default(cuid())
+  modelId String
+  model   Model  @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  // What a request names this by, unique per model and conventionally `<author>_<name>`, so two
+  // groups can fit the same trait without colliding.
+  //
+  // A row's numbers are never edited. Every stored reading records the row that measured it and
+  // nothing re-derives it, so editing one in place silently changes what those readings meant and
+  // nothing can detect it. A recalibration is a new row under a new name -- `mit_toxic_v2` -- which
+  // callers switch to deliberately.
+  name   String
+  author String
+
+  // The sites this reads, in the order `values` concatenates them. One entry today, which is why
+  // the read path narrows to a scalar; a probe summing across layers would hold several.
+  //
+  // An array rather than a scalar plus a params key, so "where does this read" has one home
+  // whatever else the projection grows.
+  layers Int[]
+
+  // What each end means. Null for a vector with one direction and no ends -- a probe, or a plain
+  // steering vector -- which nothing can label a reading from.
+  polePositive            String?
+  poleNegative            String?
+  polePositiveDescription String?
+  poleNegativeDescription String?
+
+  // For a vector whose natural label is not just its two poles. Nothing parses it.
+  displayName String?
+  // A known limitation, shown beside this vector's readings. A column because the page reads it.
+  caveat      String?
+
+  // The vector: `layers.length * model.dimension` floats, one layer's worth after another. Float[]
+  // rather than pgvector, whose indexes stop at 2000; nothing searches over these. `values` is
+  // reserved in SQL, so hand-written psql needs `"values"`.
+  values Float[]
+
+  // What this is for, and anything else worth browsing by. Read by pages, never by the projection.
+  tags VectorTagOnVector[]
+
+  // The rest of the projection: exactly the inference `NPVectorRead` payload minus what the columns
+  // above hold -- `read`, `normalize`, `center`, `scalePos`, `scaleNeg`, `preNormMean`,
+  // `postNormMean`, the three quantile tables, and `render`.
+  //
+  // Absent means defaulted, so omit a key rather than storing it empty -- inference rejects a
+  // quantile table shorter than two entries, and `[]` is one. `{}` is a whole reading: the bare dot
+  // product, in its own units, with no percentile.
+  //
+  // Nested rather than flat, because a stage is replaced whole: a row read per token declares a
+  // different `read` rather than a version number here. This mirrors a wire contract, so an
+  // inference-side rename of any of these keys is a migration here.
+  projectionParams Json @default("{}")
+
+  // Where this is published, if it is: the artifact a caller can hand to inference as a path
+  // instead of sending the numbers inline, spelled as `Source` spells the same pair.
+  //
+  // Also the only home for how the fit scored. An unpublished row records none, deliberately: what
+  // a reader needs in order to trust a reading goes in `caveat`, which is displayed.
+  hfRepoId   String?
+  hfFolderId String?
+
+  visibility Visibility @default(PRIVATE)
+  creatorId  String
+  creator    User       @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([modelId, name])
+  @@index([modelId, visibility])
+  @@index([creatorId])
 }

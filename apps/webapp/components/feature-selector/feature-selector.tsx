@@ -1,6 +1,9 @@
 'use client';
 
 import { DEFAULT_MODELID, DEFAULT_SOURCESET } from '@/lib/env';
+import { FeatureHrefBuilder } from '@/lib/utils/feature-compare';
+import { getFeaturePath } from '@/lib/utils/neuron-identifier';
+import { getDefaultSourceForModel, getDefaultSourceSetForModel, isNeuronLayerSource } from '@/lib/utils/source';
 import { useRouter } from '@bprogress/next';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { ChevronDownIcon, ChevronLeft, ChevronRight, Search } from 'lucide-react';
@@ -85,6 +88,62 @@ function HeadIndexDropdown({
   );
 }
 
+// A link, or a disabled box with no href. Crawlers follow every href, so a disabled step must not have one.
+function LinkOrDisabled({
+  href,
+  disabled,
+  className,
+  title,
+  children,
+}: {
+  href: string;
+  disabled: boolean;
+  className: string;
+  title?: string;
+  children: React.ReactNode;
+}) {
+  if (disabled) {
+    return (
+      <span title={title} aria-label={title} aria-disabled className={className}>
+        {children}
+      </span>
+    );
+  }
+  return (
+    <Link href={href} title={title} aria-label={title} className={className}>
+      {children}
+    </Link>
+  );
+}
+
+// A short link under a selector box. A real link, so ctrl-click opens a new tab.
+function StepLink({
+  href,
+  disabled,
+  title,
+  children,
+  heightClassName = 'h-3 max-h-3 min-h-3',
+}: {
+  href: string;
+  disabled: boolean;
+  title: string;
+  children: React.ReactNode;
+  heightClassName?: string;
+}) {
+  return (
+    <LinkOrDisabled
+      href={href}
+      disabled={disabled}
+      title={title}
+      className={`flex ${heightClassName} flex-1 select-none flex-row items-center justify-center gap-x-0.5 whitespace-pre rounded-sm bg-slate-200 font-mono text-[8px] font-medium uppercase leading-none text-slate-500 hover:bg-sky-700 hover:text-white ${
+        disabled ? 'pointer-events-none opacity-40' : ''
+      }`}
+    >
+      {children}
+    </LinkOrDisabled>
+  );
+}
+
 export default function FeatureSelector({
   defaultModelId,
   defaultSourceSet,
@@ -103,6 +162,7 @@ export default function FeatureSelector({
   exclusiveCallback = false,
   includeHeads = false,
   numHeadLayers = 0,
+  headLayers,
   numHeadIndexes = 0,
   defaultHeadLayer,
   showHeadFinderToggle = false,
@@ -110,6 +170,10 @@ export default function FeatureSelector({
   onHeadFinderToggle,
   onModelChange,
   onExitHeadMode,
+  includeSteerableNeurons = false,
+  getHref,
+  trailing,
+  nextPrevBelowIndex = false,
 }: {
   defaultModelId?: string;
   defaultSourceSet?: string;
@@ -130,6 +194,10 @@ export default function FeatureSelector({
   // becomes a head-index dropdown that navigates to /[modelId]/head/[layer]/[index].
   includeHeads?: boolean;
   numHeadLayers?: number;
+  // Explicit list of layers that have head data. Used for hybrid models (e.g.
+  // Qwen3-Next / Qwen3.5+) where attention layers are non-contiguous. When
+  // omitted, the selector falls back to a contiguous 0..numHeadLayers-1 range.
+  headLayers?: number[];
   numHeadIndexes?: number;
   defaultHeadLayer?: number;
   // Shows a "Head Finder" toggle button (only in head mode) to reveal an external head finder UI.
@@ -140,17 +208,42 @@ export default function FeatureSelector({
   onModelChange?: (modelId: string) => void;
   // Notified when the selector leaves attention-head mode (a non-head release/source is picked).
   onExitHeadMode?: () => void;
+  // With filterToInferenceEnabled, also offer neuron layers that can be steered
+  includeSteerableNeurons?: boolean;
+  // Builds the link for a feature, in place of its plain dashboard path. Does not apply to heads.
+  getHref?: FeatureHrefBuilder;
+  // Shown after the Go button.
+  trailing?: React.ReactNode;
+  // With showNextPrev, show Prev/Next as small links under the index box, not as buttons on the left.
+  nextPrevBelowIndex?: boolean;
 }) {
-  const { getSourceSetsForModelId, getFirstSourceForSourceSet, globalModels, getDefaultModel } = useGlobalContext();
+  const { getFirstSourceForSourceSet, globalModels, getDefaultModel } = useGlobalContext();
   const [modelId, setModelId] = useState(defaultModelId || getDefaultModel()?.id || DEFAULT_MODELID);
   const [sourceSet, setSourceSet] = useState(defaultSourceSet || DEFAULT_SOURCESET);
   const [source, setSource] = useState(defaultSource);
   const [index, setIndex] = useState<string | undefined>(defaultIndex);
   // When defined, the selector is in "attention head" mode and `index` refers to a head index.
   const [headLayer, setHeadLayer] = useState<number | undefined>(defaultHeadLayer);
+  const [hasNoSources, setHasNoSources] = useState(false);
   const router = useRouter();
+  const featureHref = getHref ?? getFeaturePath;
 
   const indexInputRef = useRef<HTMLInputElement>(null);
+
+  // On a neuron page, layer step links sit under the layer box, for the page's own neuron.
+  const pageModelId = defaultModelId || modelId;
+  const pageModel = globalModels[pageModelId];
+  const pageIndex = parseInt(defaultIndex, 10);
+  const pageLayer =
+    showNextPrev && headLayer === undefined && defaultSource && isNeuronLayerSource(defaultSource) && pageIndex >= 0
+      ? parseInt(defaultSource, 10)
+      : undefined;
+  const isNeuronPage = pageLayer !== undefined;
+  const hasPrevLayer = isNeuronPage && pageLayer > 0;
+  const hasNextLayer = isNeuronPage && (!pageModel?.layers || pageLayer + 1 < pageModel.layers);
+  // neuronsPerLayer counts MLP neurons, so it only bounds neuron pages
+  const hasNextIndex = !pageModel?.neuronsPerLayer || pageIndex + 1 < pageModel.neuronsPerLayer;
+  const indexStepLinks = showNextPrev && nextPrevBelowIndex;
 
   useEffect(() => {
     if (globalModels && !defaultSource) {
@@ -170,9 +263,9 @@ export default function FeatureSelector({
     }
     setHeadLayer(undefined);
     onModelChange?.(newModelId);
-    const newSourceSet = getSourceSetsForModelId(newModelId, filterToPublic)?.[0].name;
+    const newSourceSet = getDefaultSourceSetForModel(globalModels[newModelId], filterToPublic)?.name || '';
     setSourceSet(newSourceSet);
-    setSource(getFirstSourceForSourceSet(newModelId, newSourceSet));
+    setSource(getDefaultSourceForModel(globalModels[newModelId], filterToPublic)?.id);
   };
 
   const layerChanged = (newLayer: string) => {
@@ -224,50 +317,78 @@ export default function FeatureSelector({
         </div>
       )}
       <div className="flex items-start justify-center gap-x-1 sm:gap-x-2">
-        {showNextPrev && (
+        {showNextPrev && !nextPrevBelowIndex && (
           <div className="flex flex-row divide-x divide-slate-300 overflow-hidden rounded bg-slate-200">
-            <Link
+            <LinkOrDisabled
+              disabled={!(parseInt(defaultIndex, 10) > 0)}
               className={`group hidden h-10 min-h-[40px] select-none flex-col items-center justify-center px-1.5 text-[11px] font-medium uppercase text-slate-500 hover:bg-sky-700 hover:text-white sm:flex ${
                 parseInt(defaultIndex, 10) > 0 ? '' : 'pointer-events-none opacity-50'
               }`}
-              href={`/${modelId}/${source}/${parseInt(defaultIndex, 10) - 1}`}
+              href={featureHref(modelId, source, parseInt(defaultIndex, 10) - 1)}
             >
               <ChevronLeft className="h-4 w-4" />
               <div className="mt-0.5 text-center text-[8px] font-medium uppercase leading-none text-slate-400 group-hover:text-white">
                 Prev
               </div>
-            </Link>
+            </LinkOrDisabled>
 
-            <Link
+            <LinkOrDisabled
+              disabled={isNeuronPage && !hasNextIndex}
               className={`group hidden h-10 min-h-[40px] select-none flex-col items-center justify-center px-1.5 text-[11px] font-medium uppercase text-slate-500 hover:bg-sky-700 hover:text-white sm:flex ${
-                parseInt(defaultIndex, 10) > 0 ? '' : ''
+                isNeuronPage && !hasNextIndex ? 'pointer-events-none opacity-50' : ''
               }`}
-              href={`/${modelId}/${source}/${parseInt(defaultIndex, 10) + 1}`}
+              href={featureHref(modelId, source, parseInt(defaultIndex, 10) + 1)}
             >
               <ChevronRight className="h-4 w-4" />
               <div className="mt-0.5 text-center text-[8px] font-medium uppercase leading-none text-slate-400 group-hover:text-white">
                 Next
               </div>
-            </Link>
+            </LinkOrDisabled>
           </div>
         )}
         {showModel && !modelOnSeparateRow && (
           <ModelSelector modelId={modelId} modelIdChangedCallback={modelIdChanged} filterToRelease={filterToRelease} />
         )}
-        <SourceSelector
-          modelId={modelId}
-          defaultSource={source}
-          sourceChangedCallback={layerChanged}
-          defaultSourceSet={defaultSourceSet}
-          filterToRelease={filterToRelease}
-          filterToInferenceEnabled={filterToInferenceEnabled}
-          filterToFeaturedReleases={filterToFeaturedReleases}
-          filterToPublic={filterToPublic}
-          includeHeads={includeHeads}
-          numHeadLayers={numHeadLayers}
-          selectedHeadLayer={headLayer}
-          headLayerChangedCallback={headLayerChanged}
-        />
+        <div className="flex flex-col">
+          <SourceSelector
+            modelId={modelId}
+            defaultSource={source}
+            sourceChangedCallback={layerChanged}
+            defaultSourceSet={defaultSourceSet}
+            filterToRelease={filterToRelease}
+            filterToInferenceEnabled={filterToInferenceEnabled}
+            filterToFeaturedReleases={filterToFeaturedReleases}
+            filterToPublic={filterToPublic}
+            includeHeads={includeHeads}
+            numHeadLayers={numHeadLayers}
+            headLayers={headLayers}
+            selectedHeadLayer={headLayer}
+            headLayerChangedCallback={headLayerChanged}
+            compact={isNeuronPage}
+            noOptionsChangedCallback={setHasNoSources}
+            includeSteerableNeurons={includeSteerableNeurons}
+          />
+          {isNeuronPage && (
+            <div className="mt-0.5 flex flex-row gap-x-0.5">
+              <StepLink
+                href={featureHref(pageModelId, String(pageLayer - 1), pageIndex)}
+                disabled={!hasPrevLayer}
+                title="Previous layer, same index"
+              >
+                <ChevronLeft className="h-2.5 w-2.5" />
+                {hasPrevLayer && `Layer ${pageLayer - 1}`}
+              </StepLink>
+              <StepLink
+                href={featureHref(pageModelId, String(pageLayer + 1), pageIndex)}
+                disabled={!hasNextLayer}
+                title="Next layer, same index"
+              >
+                {hasNextLayer && `Layer ${pageLayer + 1}`}
+                <ChevronRight className="h-2.5 w-2.5" />
+              </StepLink>
+            </div>
+          )}
+        </div>
 
         {includeHeads && headLayer !== undefined ? (
           <>
@@ -297,11 +418,18 @@ export default function FeatureSelector({
           </>
         ) : (
           <>
-            <div className="flex flex-col">
-              <div className="flex h-10 max-h-[40px] min-h-[40px] flex-col items-center justify-center rounded border border-slate-300 bg-white px-0.5 py-0 text-center font-mono text-xs font-medium text-sky-700 placeholder-slate-400 focus:border-sky-700 focus:ring-0 sm:w-[60px] sm:px-1">
+            <div className={`flex flex-col ${indexStepLinks ? 'min-w-[68px]' : ''}`}>
+              <div
+                className={`flex ${
+                  indexStepLinks ? 'h-[22px] max-h-[22px] min-h-[22px]' : 'h-10 max-h-[40px] min-h-[40px]'
+                } flex-col items-center justify-center rounded border px-0.5 py-0 text-center font-mono text-xs font-medium text-sky-700 placeholder-slate-400 focus:border-sky-700 focus:ring-0 sm:w-[60px] sm:px-1 ${
+                  hasNoSources ? 'border-slate-200 bg-slate-50 opacity-50' : 'border-slate-300 bg-white'
+                }`}
+              >
                 <input
                   type="text"
                   ref={indexInputRef}
+                  disabled={hasNoSources}
                   value={index}
                   onChange={(e) => {
                     const newValue = parseInt(e.target.value, 10);
@@ -314,16 +442,40 @@ export default function FeatureSelector({
                   onKeyDown={(event: React.KeyboardEvent<any>) => {
                     if (event.key === 'Enter') {
                       event.preventDefault();
-                      router.push(`/${modelId}/${source}/${index}`);
+                      router.push(getHref ? getHref(modelId, source, index || '') : `/${modelId}/${source}/${index}`);
                     }
                   }}
                   placeholder="0"
                   className="w-[50px] border-none bg-transparent px-0 py-0 text-center text-[11px] leading-none text-sky-700 placeholder-slate-400 focus:border-none focus:ring-0 sm:w-[60px] sm:text-xs"
                 />
-                <div className="mt-0.5 text-center font-mono text-[8px] font-medium leading-none text-slate-400">
-                  INDEX
-                </div>
+                {!indexStepLinks && (
+                  <div className="mt-0.5 text-center font-mono text-[8px] font-medium leading-none text-slate-400">
+                    INDEX
+                  </div>
+                )}
               </div>
+              {indexStepLinks && (
+                <div className="mt-0.5 flex flex-row gap-x-0.5">
+                  <StepLink
+                    href={featureHref(modelId, source, pageIndex - 1)}
+                    disabled={!(pageIndex > 0)}
+                    title="Previous index"
+                    heightClassName="h-4 max-h-4 min-h-4"
+                  >
+                    <ChevronLeft className="h-2.5 w-2.5" />
+                    Prev
+                  </StepLink>
+                  <StepLink
+                    href={featureHref(modelId, source, pageIndex + 1)}
+                    disabled={isNeuronPage && !hasNextIndex}
+                    title="Next index"
+                    heightClassName="h-4 max-h-4 min-h-4"
+                  >
+                    Next
+                    <ChevronRight className="h-2.5 w-2.5" />
+                  </StepLink>
+                </div>
+              )}
             </div>
             <button
               type="button"
@@ -338,7 +490,9 @@ export default function FeatureSelector({
                   // Get defaulttesttext from query params if present
                   const urlParams = new URLSearchParams(window.location.search);
                   const defaultTestText = urlParams.get('defaulttesttext');
-                  const url = `/${modelId}/${source}/${index}${defaultTestText ? `?defaulttesttext=${defaultTestText}` : ''}`;
+                  const path = getHref ? getHref(modelId, source, index) : `/${modelId}/${source}/${index}`;
+                  const testTextParam = `${path.includes('?') ? '&' : '?'}defaulttesttext=${defaultTestText}`;
+                  const url = `${path}${defaultTestText ? testTextParam : ''}`;
                   if (!exclusiveCallback) {
                     if (openInNewTab || e.metaKey || e.ctrlKey) {
                       window.open(url, '_blank');
@@ -355,12 +509,14 @@ export default function FeatureSelector({
                   }
                 }
               }}
-              className="flex h-10 max-h-[40px] min-h-[40px] select-none items-center justify-center rounded bg-slate-200 px-3 text-[11px] font-medium uppercase text-slate-500 hover:bg-sky-700 hover:text-white"
+              disabled={hasNoSources}
+              className="flex h-10 max-h-[40px] min-h-[40px] select-none items-center justify-center rounded bg-slate-200 px-3 text-[11px] font-medium uppercase text-slate-500 hover:bg-sky-700 hover:text-white disabled:pointer-events-none disabled:opacity-50"
             >
               Go
             </button>
           </>
         )}
+        {trailing}
       </div>
     </div>
   );

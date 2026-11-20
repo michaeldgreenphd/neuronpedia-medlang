@@ -37,8 +37,10 @@ except ImportError:  # pragma: no cover - tqdm is optional for ad-hoc utility ru
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+# Repo base: headvis -> neuronpedia_utils -> neuronpedia-utils -> utils -> root
+REPO_ROOT = SCRIPT_DIR.parents[3]
 DEFAULT_EXPORTS_DIR = SCRIPT_DIR.parent / "exports"
-DEFAULT_MODEL_MAP_PATH = SCRIPT_DIR / "np_model_to_hf.json"
+DEFAULT_MODEL_MAP_PATH = REPO_ROOT / "np_model_to_hf.json"
 DEFAULT_MIN_FREE_VRAM_GB = 12.0
 DEFAULT_INDUCTION_ATTENTION_THRESHOLD = 0.01
 
@@ -80,9 +82,7 @@ METRIC_DESCRIPTIONS = {
         "Mean |q - k| weighted by attention mass. Captures how far back "
         "a head looks on average."
     ),
-    "qk_distance_variance": (
-        "Variance of |q - k| weighted by attention mass."
-    ),
+    "qk_distance_variance": ("Variance of |q - k| weighted by attention mass."),
     "induction_score": (
         "Average attention from a query token to the position after a prior "
         "occurrence of the same token. High = induction head."
@@ -267,17 +267,16 @@ class SequenceSamplingState:
         )
         self.token_cache: dict[int, list[str]] = {}
         self.n_valid_seen = 0
-        self.activations_per_head_sum = np.zeros(
-            (n_layers, n_heads), dtype=np.float64
-        )
-        self.activations_per_head_count = np.zeros(
-            (n_layers, n_heads), dtype=np.int64
-        )
+        self.activations_per_head_sum = np.zeros((n_layers, n_heads), dtype=np.float64)
+        self.activations_per_head_count = np.zeros((n_layers, n_heads), dtype=np.int64)
 
     def maybe_finalize_warmup(self) -> bool:
         if self.boundaries_set:
             return False
-        if self.warmup_filled < self.warmup_size and self.n_valid_seen < self.warmup_size:
+        if (
+            self.warmup_filled < self.warmup_size
+            and self.n_valid_seen < self.warmup_size
+        ):
             return False
         self._compute_boundaries()
         self.boundaries_set = True
@@ -289,7 +288,9 @@ class SequenceSamplingState:
         if n == 0:
             for layer_samplers in self.samplers:
                 for sampler in layer_samplers:
-                    sampler.set_boundaries([0.0] * (self.sampler_config.n_intervals - 1))
+                    sampler.set_boundaries(
+                        [0.0] * (self.sampler_config.n_intervals - 1)
+                    )
             return
         n_intervals = self.sampler_config.n_intervals
         for layer in range(self.n_layers):
@@ -322,7 +323,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional Hugging Face dataset config/subset name.",
     )
-    parser.add_argument("--dataset-split", default="train", help="Dataset split to use.")
+    parser.add_argument(
+        "--dataset-split", default="train", help="Dataset split to use."
+    )
     parser.add_argument(
         "--dataset-text-field",
         default="text",
@@ -500,9 +503,7 @@ def resolve_np_model_id(hf_model_name: str, model_map_path: str) -> str:
     if not isinstance(model_map, dict):
         raise ValueError(f"{path} must contain a JSON object.")
     matches = [
-        np_id
-        for np_id, mapped_hf in model_map.items()
-        if mapped_hf == hf_model_name
+        np_id for np_id, mapped_hf in model_map.items() if mapped_hf == hf_model_name
     ]
     if not matches:
         raise ValueError(
@@ -542,6 +543,50 @@ def get_model_config_value(model: AutoModelForCausalLM, field_name: str) -> Any:
     )
 
 
+# Layer-type markers (as they appear in HF configs' `layer_types`) for token
+# mixers that do NOT return softmax attention weights via output_attentions,
+# e.g. Qwen3-Next / Qwen3.5+ Gated DeltaNet or Mamba-style recurrent blocks.
+# Note: "sliding_attention" and "full_attention" DO return weights, so they are
+# intentionally not listed here.
+NON_ATTENTION_LAYER_MARKERS = ("linear", "mamba", "recurrent", "conv", "delta")
+
+
+def resolve_attention_layer_indices(
+    model: AutoModelForCausalLM, n_layers: int
+) -> list[int]:
+    """Return the global layer indices that emit softmax attention weights.
+
+    Hybrid models (e.g. Qwen3-Next / Qwen3.5+) interleave linear-attention
+    (Gated DeltaNet) layers with full-attention layers. With
+    output_attentions=True, transformers only returns weights for the
+    full-attention layers, so the i-th tensor in output.attentions maps to the
+    i-th *attention* layer, not the i-th model layer. This reads the config's
+    `layer_types` to recover the true global layer index for each returned
+    attention tensor. Dense models (no `layer_types`) map 1:1.
+    """
+    try:
+        layer_types = get_model_config_value(model, "layer_types")
+    except AttributeError:
+        layer_types = None
+
+    if not layer_types:
+        return list(range(n_layers))
+
+    indices = [
+        i
+        for i, layer_type in enumerate(layer_types)
+        if isinstance(layer_type, str)
+        and not any(marker in layer_type.lower() for marker in NON_ATTENTION_LAYER_MARKERS)
+    ]
+    if not indices:
+        raise RuntimeError(
+            "Resolved zero attention layers from config.layer_types="
+            f"{layer_types}. Update NON_ATTENTION_LAYER_MARKERS to match this "
+            "architecture."
+        )
+    return indices
+
+
 def warn_if_low_vram(device: torch.device, min_free_vram_gb: float) -> None:
     if device.type != "cuda":
         print("WARNING: CUDA is not available or not selected; this will be very slow.")
@@ -563,7 +608,9 @@ def prepare_model_cache(args: argparse.Namespace) -> tuple[str, bool]:
     if args.hf_cache_dir is not None:
         cache_dir = os.path.abspath(os.path.expanduser(args.hf_cache_dir))
         os.makedirs(cache_dir, exist_ok=True)
-        print(f"Using Hugging Face model cache directory, will delete after this run: {cache_dir}")
+        print(
+            f"Using Hugging Face model cache directory, will delete after this run: {cache_dir}"
+        )
         return cache_dir, True
 
     cache_dir = tempfile.mkdtemp(prefix="headvis-model-cache-")
@@ -762,6 +809,7 @@ def compute_attention_metrics_for_batch(
     sparse_topk_per_row: int,
     sparse_threshold: float,
     tokenizer: AutoTokenizer,
+    attention_layer_indices: list[int],
 ) -> tuple[int, int]:
     with torch.inference_mode():
         output = model(
@@ -774,8 +822,15 @@ def compute_attention_metrics_for_batch(
     attentions = output.attentions
     if attentions is None:
         raise RuntimeError(
-            "Model did not return attention weights. Try "
-            "--attn-implementation eager."
+            "Model did not return attention weights. Try --attn-implementation eager."
+        )
+    if len(attentions) != len(attention_layer_indices):
+        raise RuntimeError(
+            f"Model returned {len(attentions)} attention tensors but "
+            f"{len(attention_layer_indices)} attention layers were resolved from "
+            "the config. The layer-index mapping would be wrong. Check "
+            "config.layer_types and NON_ATTENTION_LAYER_MARKERS for this "
+            "architecture."
         )
 
     sequence_lengths = attention_mask.sum(dim=1)
@@ -791,10 +846,9 @@ def compute_attention_metrics_for_batch(
 
     batch_size, sequence_length = attention_mask.shape
     positions = torch.arange(sequence_length, device=input_ids.device)
-    query_mask = (
-        (positions[None, :] < sequence_lengths[:, None])
-        & valid_sequence_mask[:, None]
-    )
+    query_mask = (positions[None, :] < sequence_lengths[:, None]) & valid_sequence_mask[
+        :, None
+    ]
     pair_mask = query_mask[:, :, None] & query_mask[:, None, :]
     prev_position_mask = positions[1:][None, :] < sequence_lengths[:, None]
     qk_distance = (positions[:, None] - positions[None, :]).abs().float()
@@ -809,7 +863,8 @@ def compute_attention_metrics_for_batch(
     n_heads_runtime = attentions[0].shape[1]
     in_warmup = not sequence_state.boundaries_set
 
-    for layer_idx, attention in enumerate(attentions):
+    for attention_pos, attention in enumerate(attentions):
+        layer_idx = attention_layer_indices[attention_pos]
         layer_attention_float = attention.float()
 
         self_attention_sum[layer_idx] += (
@@ -827,29 +882,27 @@ def compute_attention_metrics_for_batch(
         pattern_entropy_sum[layer_idx] += (
             -(
                 layer_attention_float
-                * torch.log(layer_attention_float.clamp_min(torch.finfo(torch.float32).tiny))
+                * torch.log(
+                    layer_attention_float.clamp_min(torch.finfo(torch.float32).tiny)
+                )
             )
             .masked_fill(~pair_mask[:, None, :, :], 0.0)
             .sum(dim=(0, 2, 3))
         )
         qk_distance_sum[layer_idx] += (
-            layer_attention_float
-            .masked_fill(~pair_mask[:, None, :, :], 0.0)
+            layer_attention_float.masked_fill(~pair_mask[:, None, :, :], 0.0)
             .mul(qk_distance)
             .sum(dim=(0, 2, 3))
         )
         qk_distance_squared_sum[layer_idx] += (
-            layer_attention_float
-            .masked_fill(~pair_mask[:, None, :, :], 0.0)
+            layer_attention_float.masked_fill(~pair_mask[:, None, :, :], 0.0)
             .mul(qk_distance_squared)
             .sum(dim=(0, 2, 3))
         )
 
-        max_act = (
-            layer_attention_float
-            .masked_fill(~max_pair_mask[:, None, :, :], 0.0)
-            .amax(dim=(-2, -1))
-        )
+        max_act = layer_attention_float.masked_fill(
+            ~max_pair_mask[:, None, :, :], 0.0
+        ).amax(dim=(-2, -1))
         max_act_cpu = max_act.cpu().numpy()
 
         _update_histogram(
@@ -907,7 +960,8 @@ def compute_attention_metrics_for_batch(
         if induction_queries.numel() == 0:
             continue
 
-        for layer_idx, attention in enumerate(attentions):
+        for attention_pos, attention in enumerate(attentions):
+            layer_idx = attention_layer_indices[attention_pos]
             layer_attention = attention[
                 batch_idx, :, :item_sequence_length, :item_sequence_length
             ]
@@ -918,9 +972,7 @@ def compute_attention_metrics_for_batch(
                 induction_attention = induction_attention.masked_fill(
                     induction_attention < induction_attention_threshold, 0.0
                 )
-            induction_sum[layer_idx] += (
-                induction_attention.sum(dim=-1).float()
-            )
+            induction_sum[layer_idx] += induction_attention.sum(dim=-1).float()
 
     seq_id_iter = iter(batch_seq_ids)
     for b in range(batch_size):
@@ -995,7 +1047,9 @@ def build_config(
     )
 
 
-def nan_if_zero_divide(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
+def nan_if_zero_divide(
+    numerator: torch.Tensor, denominator: torch.Tensor
+) -> torch.Tensor:
     result = torch.full_like(numerator, math.nan, dtype=torch.float32)
     return torch.where(denominator > 0, numerator / denominator.clamp_min(1), result)
 
@@ -1003,16 +1057,15 @@ def nan_if_zero_divide(numerator: torch.Tensor, denominator: torch.Tensor) -> to
 def print_top_heads(metric_name: str, scores: torch.Tensor, top_k: int = 3) -> None:
     flat_scores = scores.flatten()
     valid_scores = torch.nan_to_num(flat_scores, nan=-math.inf)
-    top_values, top_indices = torch.topk(valid_scores, k=min(top_k, flat_scores.numel()))
+    top_values, top_indices = torch.topk(
+        valid_scores, k=min(top_k, flat_scores.numel())
+    )
 
     print(f"Top {len(top_values)} {metric_name}:")
     for rank, (value, flat_index) in enumerate(zip(top_values, top_indices), start=1):
         layer_idx = int(flat_index // scores.size(1))
         head_idx = int(flat_index % scores.size(1))
-        print(
-            f"  {rank}. layer={layer_idx}, head={head_idx}, "
-            f"score={float(value):.6f}"
-        )
+        print(f"  {rank}. layer={layer_idx}, head={head_idx}, score={float(value):.6f}")
 
 
 def _round_value(value: float, decimals: int = 4) -> float | None:
@@ -1134,12 +1187,12 @@ def write_head_json(
 
 def write_scatter_data(
     output_run_dir: str,
-    n_layers: int,
+    attention_layer_indices: list[int],
     n_heads: int,
     metric_values: dict[str, torch.Tensor],
 ) -> None:
     rows: list[dict[str, Any]] = []
-    for layer in range(n_layers):
+    for layer in attention_layer_indices:
         for head in range(n_heads):
             row: dict[str, Any] = {"layer": layer, "head": head}
             for metric_name in METRIC_NAMES:
@@ -1158,6 +1211,7 @@ def write_run_config_json(
     metrics_config: HeadMetricsConfig,
     n_layers: int,
     n_heads: int,
+    attention_layer_indices: list[int],
     actual_sequences_processed: int,
 ) -> None:
     """Write data/config.json for the HeadVis frontend.
@@ -1165,11 +1219,14 @@ def write_run_config_json(
     Also embeds the original metrics-pipeline config under "pipeline_config"
     so downstream loaders and reproducibility tooling have full provenance.
     """
-    heads = [[layer, head] for layer in range(n_layers) for head in range(n_heads)]
+    heads = [
+        [layer, head] for layer in attention_layer_indices for head in range(n_heads)
+    ]
     pipeline_config = asdict(metrics_config)
     pipeline_config["actual_sequences_processed"] = actual_sequences_processed
     pipeline_config["num_hidden_layers"] = n_layers
     pipeline_config["num_attention_heads"] = n_heads
+    pipeline_config["attention_layer_indices"] = list(attention_layer_indices)
 
     config_payload = {
         "model_name": args.model_name,
@@ -1280,6 +1337,13 @@ def run_head_metrics(
 
     n_layers = get_model_config_value(model, "num_hidden_layers")
     n_heads = get_model_config_value(model, "num_attention_heads")
+    attention_layer_indices = resolve_attention_layer_indices(model, n_layers)
+    if len(attention_layer_indices) != n_layers:
+        print(
+            f"Hybrid architecture detected: {len(attention_layer_indices)} of "
+            f"{n_layers} layers emit softmax attention weights. "
+            f"Attention layer indices: {attention_layer_indices}"
+        )
     accumulator_kwargs = {"device": device, "dtype": torch.float32}
     self_attention_sum = torch.zeros(n_layers, n_heads, **accumulator_kwargs)
     prev_token_sum = torch.zeros(n_layers, n_heads, **accumulator_kwargs)
@@ -1381,6 +1445,7 @@ def run_head_metrics(
                 args.sparse_topk_per_row,
                 args.sparse_threshold,
                 tokenizer,
+                attention_layer_indices,
             )
             prev_token_count += prev_positions_count
             processed_sequences += valid_sequences
@@ -1437,9 +1502,11 @@ def run_head_metrics(
         "induction_score": induction_score,
     }
 
-    write_scatter_data(output_run_dir, n_layers, n_heads, metric_tensors)
+    write_scatter_data(
+        output_run_dir, attention_layer_indices, n_heads, metric_tensors
+    )
 
-    for layer in range(n_layers):
+    for layer in attention_layer_indices:
         for head in range(n_heads):
             counts = sequence_state.histogram_counts[layer, head]
             count = int(sequence_state.activations_per_head_count[layer, head])
@@ -1471,7 +1538,13 @@ def run_head_metrics(
         warmup_size,
     )
     write_run_config_json(
-        output_run_dir, args, metrics_config, n_layers, n_heads, processed_sequences
+        output_run_dir,
+        args,
+        metrics_config,
+        n_layers,
+        n_heads,
+        attention_layer_indices,
+        processed_sequences,
     )
 
     print(f"Wrote HeadVis tree to {output_run_dir}")

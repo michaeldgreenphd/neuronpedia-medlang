@@ -2,14 +2,14 @@
 
 import ActivationSingleForm from '@/components/activation-single-form';
 import { ACTIVATION_DISPLAY_DEFAULT_CONTEXT_TOKENS } from '@/lib/utils/activations';
+import { CIRCUIT_SPARSITY_MODELS } from '@/lib/utils/circuit-sparsity';
 import * as ToggleGroup from '@radix-ui/react-toggle-group';
 import * as Tooltip from '@radix-ui/react-tooltip';
 import { HelpCircle } from 'lucide-react';
 import { Activation, ActivationPartialWithRelations, NeuronWithPartialRelations } from 'prisma/generated/zod';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import 'react-loading-skeleton/dist/skeleton.css';
 import ActivationItem from './activation-item';
-import { CIRCUIT_SPARSITY_MODELS } from '@/lib/utils/circuit-sparsity';
 import { useGlobalContext } from './provider/global-provider';
 
 export default function ActivationsList({
@@ -18,7 +18,6 @@ export default function ActivationsList({
   defaultRange = 1,
   defaultShowLineBreaks = true,
   showControls = true,
-  showDatasource = true,
   showTopActivationToken = true,
   showTest = false,
   showActivations = true,
@@ -29,8 +28,6 @@ export default function ActivationsList({
   overrideLeading,
   overrideTextSize,
   activationItemClassName,
-  // by default we show the actual tokens instead of hiding special tokens (eg for chat / reasoning)
-  defaultShowRawTokens = true,
   showSteerButton = true,
   showTestField = true,
 }: {
@@ -39,7 +36,6 @@ export default function ActivationsList({
   defaultRange?: number;
   defaultShowLineBreaks?: boolean;
   showControls?: boolean;
-  showDatasource?: boolean;
   showTopActivationToken?: boolean;
   showTest?: boolean;
   showActivations?: boolean;
@@ -50,7 +46,6 @@ export default function ActivationsList({
   overrideLeading?: string | undefined;
   overrideTextSize?: string | undefined;
   activationItemClassName?: string;
-  defaultShowRawTokens?: boolean;
   showSteerButton?: boolean;
   showTestField?: boolean;
 }) {
@@ -58,16 +53,53 @@ export default function ActivationsList({
   // used for showing correct snippet
   const [selectedRange, setSelectedRange] = useState(defaultRange);
   const [showLineBreaks, setShowLineBreaks] = useState(defaultShowLineBreaks);
-  const isConnectedNeuronsModel = CIRCUIT_SPARSITY_MODELS.includes(feature?.modelId || '');
-  const [showRawTokens, setShowRawTokens] = useState(isConnectedNeuronsModel ? true : defaultShowRawTokens);
+  // Positive and negative columns side by side: circuit-sparsity models, and dashboards read from files.
+  const isTwoColumnLayout =
+    CIRCUIT_SPARSITY_MODELS.includes(feature?.modelId || '') ||
+    Boolean(getSourceSet(feature?.modelId || '', feature?.sourceSetName || '')?.externalDashboardsUrl);
   const [dfaSplit, setDfaSplit] = useState(true);
   // used to determine colors
   const [overallMaxValue, setOverallMaxValue] = useState<number>(-100);
+  const overallMinValue = useMemo(
+    () =>
+      (activations || []).reduce(
+        (min, act) => (act.values || []).reduce((rowMin, v) => (v < rowMin ? v : rowMin), min),
+        0,
+      ),
+    [activations],
+  );
   const [items, setItems] = useState<ActivationPartialWithRelations[]>([]);
   const [topItems, setTopItems] = useState<ActivationPartialWithRelations[]>([]);
   const [bottomItems, setBottomItems] = useState<ActivationPartialWithRelations[]>([]);
   const [activationTestText, setActivationTestText] = useState('');
   const [showHidden, setShowHidden] = useState(false);
+  // Mobile shows one column at a time; until the user picks, the side with the larger magnitude.
+  const [mobileColumn, setMobileColumn] = useState<'top' | 'bottom' | undefined>();
+  const topPeak = useMemo(() => topItems.reduce((max, act) => Math.max(max, act.maxValue || 0), 0), [topItems]);
+  const bottomPeak = useMemo(
+    () => bottomItems.reduce((min, act) => Math.min(min, act.minValue ?? Math.min(0, ...(act.values || []))), 0),
+    [bottomItems],
+  );
+  const activeMobileColumn = mobileColumn ?? (Math.abs(bottomPeak) > topPeak ? 'bottom' : 'top');
+
+  // A header where a new interval starts in a column. Rows without bins get none.
+  function columnIntervalHeader(list: ActivationPartialWithRelations[], i: number, column: 'top' | 'bottom') {
+    const act = list[i];
+    if (act.binMax === null || act.binMax === undefined) {
+      return null;
+    }
+    const prev = i > 0 ? list[i - 1] : undefined;
+    if (prev && prev.binMin === act.binMin && prev.binMax === act.binMax) {
+      return null;
+    }
+    return (
+      <div className="-mx-3 -mt-1 mb-1 bg-slate-50 px-3 py-1 font-mono text-[8px] font-bold uppercase text-slate-500">
+        {act.binContains === null || act.binContains === undefined
+          ? `${column === 'top' ? 'Top' : 'Bottom'} Activations`
+          : `Interval ${act.binMin?.toFixed(3)} to ${act.binMax.toFixed(3)} (Contains ${(act.binContains * 100).toFixed(3)}%)`}
+      </div>
+    );
+  }
 
   function getMaxValueOfActivations(activationsToCheck: ActivationPartialWithRelations[]) {
     let tempOverallMaxValue = -100;
@@ -85,19 +117,20 @@ export default function ActivationsList({
     if (activations && activations.length > 0) {
       setOverallMaxValue(getMaxValueOfActivations(activations));
       let sortedActs = activations;
-      // For models with connected neurons, always show all activations without filtering
-      const skipFiltering = CIRCUIT_SPARSITY_MODELS.includes(feature?.modelId || '');
+      // The two-column layout shows every activation, without filtering
+      const skipFiltering = isTwoColumnLayout;
 
-      // For connected neurons models, split into top/bottom columns
       if (skipFiltering) {
+        // Each column is grouped by interval (outermost first), then sorted by value within it.
         const topActivations = activations
           .filter((act) => act.dataSource === 'top')
-          .toSorted((a, b) => (b.maxValue || 0) - (a.maxValue || 0)); // highest to lowest
+          .toSorted((a, b) => (b.binMax ?? 0) - (a.binMax ?? 0) || (b.maxValue || 0) - (a.maxValue || 0));
         const bottomActivations = activations
           .filter((act) => act.dataSource === 'bottom')
-          .toSorted((a, b) => (a.maxValue || 0) - (b.maxValue || 0)); // lowest to highest
+          .toSorted((a, b) => (a.binMin ?? 0) - (b.binMin ?? 0) || (a.maxValue || 0) - (b.maxValue || 0));
         setTopItems(topActivations);
         setBottomItems(bottomActivations);
+        setMobileColumn(undefined);
         setItems(activations);
         return;
       }
@@ -230,7 +263,7 @@ export default function ActivationsList({
       }
       setItems(sortedActs);
     }
-  }, [activations, user, showHidden]);
+  }, [activations, user, showHidden, isTwoColumnLayout]);
 
   useEffect(() => {
     setSelectedRange(defaultRange);
@@ -258,13 +291,14 @@ export default function ActivationsList({
             embed={embed}
             hideSteer={!showSteerButton}
             hideTestField={!showTestField}
+            overallMinValue={overallMinValue}
           />
         </div>
       )}
       {feature && feature.activations && feature?.activations.length > 0 && showActivations && (
         <div
           className={`${
-            showControls ? 'flex' : 'hidden'
+            showControls ? (isTwoColumnLayout ? 'hidden sm:flex' : 'flex') : 'hidden'
           } flex-row gap-x-2 overflow-hidden border-b bg-white px-2 pb-1 sm:px-3 sm:pb-2`}
         >
           <ToggleGroup.Root
@@ -326,34 +360,6 @@ export default function ActivationsList({
           <ToggleGroup.Root
             className="mb-1 ml-auto mt-1 inline-flex flex-1 overflow-hidden rounded bg-slate-100 px-0 py-0 sm:rounded-md"
             type="single"
-            defaultValue={showRawTokens ? 'showRawTokens' : 'hideRawTokens'}
-            value={showRawTokens ? 'showRawTokens' : 'hideRawTokens'}
-            onValueChange={(value) => {
-              setShowRawTokens(value === 'showRawTokens');
-            }}
-            aria-label="Show raw or formatted tokens"
-          >
-            <ToggleGroup.Item
-              key="showRawTokens"
-              className="flex-1 items-center rounded px-1 py-1 text-[10px] font-medium text-slate-400 transition-all hover:bg-slate-100 data-[state=on]:bg-slate-200 data-[state=on]:text-slate-600 sm:rounded-md sm:px-4 sm:py-1.5 sm:text-[11px]"
-              value="showRawTokens"
-              aria-label="showRawTokens"
-            >
-              Show Raw Tokens
-            </ToggleGroup.Item>
-
-            <ToggleGroup.Item
-              key="hideRawTokens"
-              className="flex-1 items-center rounded-md px-1 py-1 text-[10px] font-medium text-slate-400 transition-all hover:bg-slate-100 data-[state=on]:bg-slate-200 data-[state=on]:text-slate-600 sm:px-4 sm:py-1.5 sm:text-[11px]"
-              value="hideRawTokens"
-              aria-label="hideRawTokens"
-            >
-              Show Formatted
-            </ToggleGroup.Item>
-          </ToggleGroup.Root>
-          <ToggleGroup.Root
-            className="mb-1 ml-auto mt-1 inline-flex flex-1 overflow-hidden rounded bg-slate-100 px-0 py-0 sm:rounded-md"
-            type="single"
             defaultValue={showLineBreaks ? 'showLineBreaks' : 'hideLineBreaks'}
             value={showLineBreaks ? 'showLineBreaks' : 'hideLineBreaks'}
             onValueChange={(value) => {
@@ -386,12 +392,32 @@ export default function ActivationsList({
           <div className="flex h-48 w-full flex-col items-center justify-center">
             <h1 className="text-lg font-bold text-slate-300">No Known Activations</h1>
           </div>
-        ) : isConnectedNeuronsModel ? (
-          // Two-column layout for connected neurons models
+        ) : isTwoColumnLayout ? (
+          // Two-column layout: negative and positive activations
           <div className="flex flex-col gap-x-0 sm:flex-row">
-            {/* Right column: Bottom activations (lowest to highest) */}
-            <div className="flex-1">
-              <div className="flex flex-row items-center gap-x-1 bg-slate-100 px-3 py-2 font-mono text-[10px] font-bold uppercase text-slate-600">
+            {/* Mobile: one column at a time, picked with tabs */}
+            <div className="border-b bg-white px-2 py-1.5 sm:hidden">
+              <div className="flex flex-row overflow-hidden rounded-md border border-sky-600">
+                {(['bottom', 'top'] as const).map((column) => (
+                  <button
+                    key={column}
+                    type="button"
+                    onClick={() => setMobileColumn(column)}
+                    className={`flex flex-1 flex-col items-center justify-center py-1.5 text-center font-mono text-[10px] font-bold uppercase leading-snug transition-all [&:not(:first-child)]:border-l [&:not(:first-child)]:border-sky-600 ${
+                      activeMobileColumn === column ? 'bg-sky-600 text-white' : 'bg-white text-sky-700'
+                    }`}
+                  >
+                    <div>{column === 'bottom' ? 'Negative Activations' : 'Positive Activations'}</div>
+                    <div className="font-medium normal-case">
+                      {column === 'bottom' ? `Min ${Math.round(bottomPeak)}` : `Max +${Math.round(topPeak)}`}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+            {/* Right column: Bottom activations (lowest to highest). min-w-0 keeps both columns the same width. */}
+            <div className={`min-w-0 flex-1 ${activeMobileColumn === 'bottom' ? '' : 'hidden sm:block'}`}>
+              <div className="hidden flex-row items-center gap-x-1 bg-slate-100 px-3 py-2 font-mono text-[10px] font-bold uppercase text-slate-600 sm:flex">
                 <div className="rounded-sm bg-rose-400 px-1 py-[1px]">Negative</div> Activations
               </div>
               {bottomItems.length === 0 ? (
@@ -406,8 +432,10 @@ export default function ActivationsList({
                       selectedRange > 0 && 'sm:py-2'
                     }`}
                   >
+                    {columnIntervalHeader(bottomItems, activationIndex, 'bottom')}
                     <div className="flex w-full flex-row items-center justify-center">
-                      <div className="flex w-full flex-auto flex-col text-left text-sm">
+                      {/* A token wider than the column is cut at its edge. Its tooltip shows all of it. */}
+                      <div className="flex w-full min-w-0 flex-auto flex-col overflow-clip text-left text-sm">
                         {activation.tokens && (
                           <ActivationItem
                             key={`bottom-${ACTIVATION_DISPLAY_DEFAULT_CONTEXT_TOKENS[selectedRange].size}-${activationIndex}${showLineBreaks}`}
@@ -422,10 +450,10 @@ export default function ActivationsList({
                             dfaSplit={dfaSplit}
                             showCopy={showCopy}
                             overallMaxActivationValueInList={overallMaxValue}
+                            overallMinActivationValueInList={overallMinValue}
                             overrideLeading={overrideLeading}
                             overrideTextSize={overrideTextSize || 'text-[9.5px] sm:text-xs'}
                             className={activationItemClassName}
-                            showRawTokens={showRawTokens}
                           />
                         )}
                       </div>
@@ -435,8 +463,10 @@ export default function ActivationsList({
               )}
             </div>
             {/* Left column: Top activations (highest to lowest) */}
-            <div className="flex-1 border-r border-slate-200">
-              <div className="flex flex-row items-center gap-x-1 bg-slate-100 px-3 py-2 font-mono text-[10px] font-bold uppercase text-slate-600">
+            <div
+              className={`min-w-0 flex-1 border-r border-slate-200 ${activeMobileColumn === 'top' ? '' : 'hidden sm:block'}`}
+            >
+              <div className="hidden flex-row items-center gap-x-1 bg-slate-100 px-3 py-2 font-mono text-[10px] font-bold uppercase text-slate-600 sm:flex">
                 <div className="rounded-sm bg-emerald-400 px-1 py-[1px]">Positive</div> Activations
               </div>
               {topItems.length === 0 ? (
@@ -449,8 +479,9 @@ export default function ActivationsList({
                       selectedRange > 0 && 'sm:py-2'
                     }`}
                   >
+                    {columnIntervalHeader(topItems, activationIndex, 'top')}
                     <div className="flex w-full flex-row items-center justify-center">
-                      <div className="flex w-full flex-auto flex-col text-left text-sm">
+                      <div className="flex w-full min-w-0 flex-auto flex-col overflow-clip text-left text-sm">
                         {activation.tokens && (
                           <ActivationItem
                             key={`top-${ACTIVATION_DISPLAY_DEFAULT_CONTEXT_TOKENS[selectedRange].size}-${activationIndex}${showLineBreaks}`}
@@ -465,10 +496,10 @@ export default function ActivationsList({
                             dfaSplit={dfaSplit}
                             showCopy={showCopy}
                             overallMaxActivationValueInList={overallMaxValue}
+                            overallMinActivationValueInList={overallMinValue}
                             overrideLeading={overrideLeading}
                             overrideTextSize={overrideTextSize || 'text-[9.5px] sm:text-xs'}
                             className={activationItemClassName}
-                            showRawTokens={showRawTokens}
                           />
                         )}
                       </div>
@@ -582,16 +613,11 @@ export default function ActivationsList({
                           dfaSplit={dfaSplit}
                           showCopy={showCopy}
                           overallMaxActivationValueInList={overallMaxValue}
+                          overallMinActivationValueInList={overallMinValue}
                           overrideLeading={overrideLeading}
                           overrideTextSize={overrideTextSize || 'text-[9.5px] sm:text-xs'}
                           className={activationItemClassName}
-                          showRawTokens={showRawTokens}
                         />
-                      )}
-                      {showDatasource && activation.dataSource && (
-                        <div className="flex w-full flex-row items-center justify-end pt-0.5 text-right text-[8px] font-medium leading-none text-slate-400 sm:pt-0">
-                          {activation.dataSource}
-                        </div>
                       )}
                     </div>
                   </div>

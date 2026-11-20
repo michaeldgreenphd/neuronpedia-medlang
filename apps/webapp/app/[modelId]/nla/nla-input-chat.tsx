@@ -28,20 +28,21 @@ import {
   NLA_TOUR_LLAMA_LIE_QUESTION_ELEMENT_ID,
   NLA_TOUR_LLAMA_LIE_QUESTION_POSITION,
 } from './nla-tour-constants';
-import { ChatMessage, TokenInfo } from './nla-types';
+import { ChatMessage, TokenInfo, TokenMessageGroup } from './nla-types';
 import {
-  buildSyntheticUserTurnPreviewGroup,
+  chatMessagesKey,
   cleanPartialText,
   computeRelativeMse,
   groupTokensIntoMessages,
+  isInjectedSystemGroup,
   MAX_TOKENS_TO_EXPLAIN,
+  messageGroups,
 } from './nla-utils';
 
 export default function NLAInputChat() {
   const {
     chatMessages,
     setChatMessages,
-    tokenizerFormat,
     selectedModelId: modelId,
     selectedNlaSource,
     temperature,
@@ -151,21 +152,40 @@ export default function NLAInputChat() {
   // After hydrating from a cache the conversation is swapped in
   // synchronously across multiple state updates; the existing effect above
   // races with subsequent layout passes (chips render after tokenList
-  // updates). Force a scroll-to-bottom after the next paint so the user
-  // always lands at the most recent turn.
+  // updates). Force a scroll after the next paint so the user lands
+  // somewhere useful.
+  //
+  // When the hydrated demo/deep-link pre-selects a token (`lockedPosition`
+  // / `selectedPosition`, batched into the same render as `chatScrollNonce`),
+  // that token can sit above the fold on mobile where the chat pane is
+  // short — snapping to the bottom would hide it. So bring the pre-selected
+  // token into view instead; otherwise fall back to scrolling to the
+  // most recent turn. `lockedPosition`/`selectedPosition` are intentionally
+  // read via closure (not deps) so ordinary hover/lock changes don't
+  // re-trigger this scroll — only a fresh hydrate (nonce bump) does.
   useEffect(() => {
     if (chatScrollNonce === 0) return undefined;
+    const focusPosition = lockedPosition ?? selectedPosition;
     let raf2 = 0;
     const raf1 = requestAnimationFrame(() => {
       raf2 = requestAnimationFrame(() => {
         const el = scrollRef.current;
-        if (el) el.scrollTop = el.scrollHeight;
+        if (!el) return;
+        if (focusPosition !== null) {
+          const target = el.querySelector(`[data-token-position="${focusPosition}"]`);
+          if (target) {
+            target.scrollIntoView({ block: 'center', behavior: 'auto' });
+            return;
+          }
+        }
+        el.scrollTop = el.scrollHeight;
       });
     });
     return () => {
       cancelAnimationFrame(raf1);
       if (raf2) cancelAnimationFrame(raf2);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatScrollNonce]);
 
   // ── Chip selection / drag state
@@ -302,8 +322,8 @@ export default function NLAInputChat() {
 
   const tokenGroups = useMemo(() => {
     if (tokenList.length === 0) return null;
-    return groupTokensIntoMessages(tokenList, tokenizerFormat);
-  }, [tokenList, tokenizerFormat]);
+    return groupTokensIntoMessages(tokenList);
+  }, [tokenList]);
 
   // Bridges chat end → explain start (auto mode). Hoisted so explanation search can use `isBusy`.
   const [autoExplainPending, setAutoExplainPending] = useState(false);
@@ -504,7 +524,7 @@ export default function NLAInputChat() {
     // gives the larger glyphs room to breathe across wrapped lines.
     const isTourDemo = activeDemoCacheId === NLA_TOUR_LLAMA_LIE_CACHE_ID;
     const nonSmallSizeClass = isTourDemo
-      ? 'px-[0.5px] py-0 text-[14px] sm:text-[18px] leading-relaxed'
+      ? 'px-[0.5px] py-0 text-[12px] sm:text-[18px] leading-relaxed'
       : 'px-[0.5px] py-0 text-[12px] sm:text-[14px] leading-tight';
 
     if (preview) {
@@ -591,11 +611,16 @@ export default function NLAInputChat() {
     // RMSE = worse reconstruction, so "low confidence" is `>= threshold`.
     const isLowConfidence = chipScore !== null && chipScore >= CONFIDENCE_THRESHOLD;
     const cannotAdd = !isInSelection && selectionLimitReached;
-    // The slate sweep keeps animating until we have a score: it covers
-    // both "not yet started / mid-explain" (paired with the amber bg) and
-    // the brief "explained but not scored" window (paired with the white
-    // bg, so the chip clearly reads as "explanation done, awaiting score").
-    const showLoadingSweep = !isScored && (chipIsGenerating || isExplained);
+    // The slate sweep animates while work is still outstanding: during
+    // generation (amber bg), and during the brief "explanation streamed in
+    // but the final result event hasn't landed yet" window (white bg —
+    // reads as "explanation done, awaiting score"). The score is delivered
+    // bundled in the final result event, so once `result` arrives there is
+    // nothing left to wait for and the sweep stops — even when `mse` is
+    // null (e.g. the reconstructor/scoring is disabled server-side).
+    // Keying this on `isScored` instead would leave the sweep running
+    // forever whenever scoring is off.
+    const showLoadingSweep = chipIsGenerating || (isExplained && !result);
     const isExplanationSearchHit = explanationSearchActive && explanationSearchMatchSet.has(tok.position);
 
     let colorClass: string;
@@ -837,15 +862,7 @@ export default function NLAInputChat() {
     // );
   }
 
-  function renderTokenGroup(
-    group: {
-      role: 'user' | 'assistant';
-      headerTokens: TokenInfo[];
-      contentTokens: TokenInfo[];
-      footerTokens: TokenInfo[];
-    },
-    opts?: { preview?: boolean },
-  ) {
+  function renderTokenGroup(group: TokenMessageGroup, opts?: { preview?: boolean }) {
     const preview = opts?.preview ?? false;
     // Render tokens as a sequence of per-line rows (one `flex flex-row
     // flex-wrap` per visual line). Splitting newline-delimited runs into
@@ -941,13 +958,6 @@ export default function NLAInputChat() {
     );
   }
 
-  function stripTrailingTurnEnd(content: string): string {
-    if (content.endsWith(tokenizerFormat.turnEndToken)) {
-      return content.slice(0, -tokenizerFormat.turnEndToken.length);
-    }
-    return content;
-  }
-
   async function sendMessage() {
     const trimmed = typedText.trim();
     if (!trimmed || isChatStreaming || isLoading || isEditingAssistant) return;
@@ -996,11 +1006,8 @@ export default function NLAInputChat() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          text: tokenizerFormat.formatChat(nextMessages),
-          // Sent in addition to `text` so the route can forward to a
-          // chat-completion provider (e.g. OpenRouter) that needs
-          // structured messages rather than the chat-templated string.
-          // The NLA inference server ignores this field.
+          // Structured messages only — the server applies the chat template and
+          // returns per-token spans (and forwards to OpenRouter for generation).
           messages: [...cleaned, userTurn],
           completion_tokens: maxNewTokens,
           temperature,
@@ -1074,20 +1081,24 @@ export default function NLAInputChat() {
           accumulatedTokens = [...parsed.tokens];
           setTokenList(accumulatedTokens);
         } else if (parsed.type === 'token' && parsed.token && typeof parsed.token.token === 'string') {
-          accumulatedText += parsed.token.token;
+          // `footer` marks the model's own turn-end token, which generate()
+          // always emits before stopping. It belongs in the chip strip but not
+          // in the message content, or it would be sent back as text next turn.
+          if (parsed.token.section !== 'footer') {
+            accumulatedText += parsed.token.token;
+          }
           accumulatedTokens = [...accumulatedTokens, parsed.token];
           setTokenList(accumulatedTokens);
-          const cleanedText = stripTrailingTurnEnd(accumulatedText);
           setChatMessages((prev) => {
             if (prev.length === 0) return prev;
             const arr = [...prev];
-            arr[arr.length - 1] = { role: 'assistant', content: cleanedText };
+            arr[arr.length - 1] = { role: 'assistant', content: accumulatedText };
             return arr;
           });
         }
       }
 
-      const finalText = stripTrailingTurnEnd(accumulatedText);
+      const finalText = accumulatedText;
       setChatMessages((prev) => {
         if (prev.length === 0) return prev;
         const arr = [...prev];
@@ -1102,13 +1113,12 @@ export default function NLAInputChat() {
       // lastTokenizedText so a subsequent Explain click skips the redundant
       // tokenize round-trip.
       const finalMessages: ChatMessage[] = [...cleaned, userTurn, { role: 'assistant', content: finalText }];
-      const canonicalText = tokenizerFormat.formatChat(finalMessages);
       try {
         const tokRes = await fetch('/api/nla/completion', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            text: canonicalText,
+            messages: finalMessages,
             completion_tokens: 0,
             modelId: modelId || undefined,
             nlaSourceId: nlaSourceId || undefined,
@@ -1126,7 +1136,7 @@ export default function NLAInputChat() {
       } catch {
         // ignore — fall back to the streamed tokens we already have
       }
-      setLastTokenizedText(canonicalText);
+      setLastTokenizedText(chatMessagesKey(finalMessages));
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
         // User cancelled mid-stream. Roll back to the pre-send state
@@ -1194,7 +1204,22 @@ export default function NLAInputChat() {
   // still empty (the streaming-assistant placeholder when the prompt event
   // hasn't arrived yet) just don't have a group and fall back to the
   // text-bubble rendering.
-  const groupForIndex = (idx: number) => tokenGroups?.messages?.[idx];
+  //
+  // The positional pairing goes stale between appending a new turn and the
+  // `prompt` event replacing `tokenList`, since we deliberately keep the
+  // previous turns' tokens on screen through that window. Roles strictly
+  // alternate, so a role mismatch identifies a group that belongs to some
+  // other bubble; treat it as "no group yet" rather than rendering the wrong
+  // tokens.
+  const pairedGroups = tokenGroups ? messageGroups(tokenGroups.messages) : [];
+  const groupForIndex = (idx: number) => {
+    const group = pairedGroups[idx];
+    if (!group || group.role !== visibleMessages[idx]?.msg.role) return undefined;
+    return group;
+  };
+  // A system turn the chat template injected itself. It has no chat message,
+  // so it gets its own bubble ahead of the first message.
+  const injectedSystemGroups = tokenGroups ? tokenGroups.messages.filter(isInjectedSystemGroup) : [];
 
   // Live count of selected tokens that haven't finished being explained
   // yet. A token counts as explained the moment either (a) the streaming
@@ -1350,8 +1375,8 @@ export default function NLAInputChat() {
   // semantics as user-message edit: a confirm gate, then we clear all
   // selections + details focus so nothing reads stale state. The
   // editor only exposes the message `content` text — the surrounding
-  // chat-template tokens are re-applied by `tokenizerFormat.formatChat`
-  // on save, so the user can't desync the templating.
+  // chat-template tokens are re-applied by the NLA server (which owns the
+  // chat template) on the re-tokenize, so the user can't desync the templating.
   const handleStartAssistantEdit = (originalIdx: number, content: string) => {
     if (isChatStreaming || isLoading || isEditingAssistant) return;
     // eslint-disable-next-line no-alert
@@ -1404,12 +1429,11 @@ export default function NLAInputChat() {
     setRetokenizingIdx(idx);
 
     try {
-      const canonicalText = tokenizerFormat.formatChat(newMessages);
       const res = await fetch('/api/nla/completion', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          text: canonicalText,
+          messages: newMessages,
           completion_tokens: 0,
           modelId: modelId || undefined,
           nlaSourceId: nlaSourceId || undefined,
@@ -1423,7 +1447,7 @@ export default function NLAInputChat() {
         const data = (await res.json()) as { tokens?: TokenInfo[] };
         if (Array.isArray(data.tokens)) {
           setTokenList(data.tokens);
-          setLastTokenizedText(canonicalText);
+          setLastTokenizedText(chatMessagesKey(newMessages));
         }
       }
     } catch {
@@ -1725,6 +1749,18 @@ export default function NLAInputChat() {
             onMouseDown={() => setLockedPosition(null)}
             className="flex h-full max-h-full min-h-0 flex-1 flex-col gap-y-0 overflow-y-auto pt-1 sm:pb-3 sm:pr-1 sm:pt-4"
           >
+            {injectedSystemGroups.map((group, i) => (
+              <div key={`system-${i}`} className="flex w-full justify-end">
+                <div className="flex max-w-[95%] flex-col items-end gap-y-0 px-0.5 sm:max-w-[85%]">
+                  <div className="select-none rounded-xl bg-white py-1 shadow sm:px-3.5">
+                    <div className="px-1 pt-1 text-[9px] font-semibold uppercase tracking-wide text-slate-400">
+                      system
+                    </div>
+                    {renderTokenGroup(group)}
+                  </div>
+                </div>
+              </div>
+            ))}
             {visibleMessages.map(({ msg, originalIdx }, idx) => {
               const group = groupForIndex(idx);
               const showChips =
@@ -1802,21 +1838,6 @@ export default function NLAInputChat() {
                         className={`select-none rounded-xl sm:px-3.5 ${isUser ? 'bg-white py-1 shadow' : 'bg-transparent py-0'}`}
                       >
                         {renderTokenGroup(group)}
-                      </div>
-                    ) : isUser && showChatTokens && !showChips && msg.content.length > 0 ? (
-                      <div
-                        className={`select-none rounded-xl sm:px-3.5 ${isUser ? 'bg-white py-1 shadow' : 'bg-transparent py-0'}`}
-                      >
-                        {renderTokenGroup(
-                          buildSyntheticUserTurnPreviewGroup(
-                            tokenizerFormat,
-                            msg,
-                            originalIdx,
-                            chatMessages.length,
-                            -1_000_000 - originalIdx * 16,
-                          ),
-                          { preview: true },
-                        )}
                       </div>
                     ) : (
                       <div

@@ -1,6 +1,9 @@
+import EmbedOpenFullPageBar from '@/components/embed-open-full-page-bar';
+import MdxDevReload from '@/components/mdx-dev-reload';
 import Navbar from '@/components/nav/navbar';
 import AuthProvider from '@/components/provider/auth-provider';
 import { Providers } from '@/components/provider/providers';
+import { TurnstileProvider } from '@/components/provider/turnstile-provider';
 import SimilarityMatrixModal from '@/components/similarity-matrix-modal';
 import Toast from '@/components/toast';
 import {
@@ -11,7 +14,13 @@ import {
 } from '@/lib/db/explanation-type';
 import { getGlobalSourceReleases } from '@/lib/db/source';
 import { makeAuthedUserFromSessionOrReturnNull } from '@/lib/db/user';
-import { ENABLE_VERCEL_ANALYTICS, NEXT_PUBLIC_URL } from '@/lib/env';
+import {
+  CLOUDFLARE_TURNSTILE_SITEKEY,
+  ENABLE_VERCEL_ANALYTICS,
+  NEXT_PUBLIC_URL,
+  NODE_ENV,
+  TURNSTILE_ENABLED,
+} from '@/lib/env';
 import { formatToGlobalModels } from '@/lib/utils/general';
 import { Analytics } from '@vercel/analytics/react';
 import { Metadata } from 'next';
@@ -31,6 +40,10 @@ export const viewport = {
   maximumScale: 1,
   userScalable: false,
 };
+
+// Marks an embed shown in an iframe before the first paint, so its bar does not shift the layout. It changes
+// <html> before hydration, so the embed's <html> suppresses the hydration warning.
+const MARK_IN_IFRAME_SCRIPT = "if (window.self !== window.top) document.documentElement.classList.add('in-iframe');";
 
 export async function generateMetadata(): Promise<Metadata> {
   const description = 'Open Source Interpretability Platform';
@@ -86,37 +99,48 @@ export default async function RootLayout({ children }: { children: React.ReactNo
   const isEmbed = headersList.get('x-is-embed') === 'true';
 
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning={isEmbed}>
+      {isEmbed && (
+        <head>
+          <script dangerouslySetInnerHTML={{ __html: MARK_IN_IFRAME_SCRIPT }} />
+        </head>
+      )}
       <body
-        className={`flex min-h-screen flex-col bg-slate-50 bg-fixed ${inter.className} ${
-          isEmbed ? 'overscroll-auto' : 'overscroll-none'
+        className={`flex min-h-[100dvh] flex-col bg-slate-50 bg-fixed ${inter.className} ${
+          isEmbed ? 'embed overscroll-auto' : 'overscroll-none'
         }`}
       >
         <AuthProvider session={session}>
-          <Providers
-            initialModels={initialModels}
-            initialExplanationTypes={explanationTypes}
-            initialExplanationModels={explanationModels}
-            initialReleases={releases}
-            initialExplanationScoreTypes={explanationScoreTypes}
-            initialExplanationScoreModelTypes={explanationScoreModelTypes}
-          >
-            <Toast />
-            {!isEmbed && (
-              <Suspense fallback="">
-                <Navbar session={session} />
-              </Suspense>
-            )}
-            <FeatureModal />
-            <SimilarityMatrixModal />
-            <main
-              className={`flex w-full flex-1 flex-col items-center gap-0 ${isEmbed ? 'pt-0' : 'pt-12 sm:pt-12'}`}
+          <TurnstileProvider siteKey={TURNSTILE_ENABLED ? CLOUDFLARE_TURNSTILE_SITEKEY : ''}>
+            <Providers
+              initialModels={initialModels}
+              initialExplanationTypes={explanationTypes}
+              initialExplanationModels={explanationModels}
+              initialReleases={releases}
+              initialExplanationScoreTypes={explanationScoreTypes}
+              initialExplanationScoreModelTypes={explanationScoreModelTypes}
             >
-              {children}
-            </main>
-            {!isEmbed && <Footer />}
-            {ENABLE_VERCEL_ANALYTICS && <Analytics />}
-          </Providers>
+              <Toast />
+              {!isEmbed && (
+                <Suspense fallback="">
+                  <Navbar session={session} />
+                </Suspense>
+              )}
+              <FeatureModal />
+              <SimilarityMatrixModal />
+              {isEmbed && (
+                <Suspense fallback="">
+                  <EmbedOpenFullPageBar />
+                </Suspense>
+              )}
+              <main className={`flex w-full flex-1 flex-col items-center gap-0 ${isEmbed ? 'pt-0' : 'pt-12 sm:pt-12'}`}>
+                {children}
+              </main>
+              {!isEmbed && <Footer />}
+              {ENABLE_VERCEL_ANALYTICS && <Analytics />}
+              {NODE_ENV === 'development' && <MdxDevReload />}
+            </Providers>
+          </TurnstileProvider>
         </AuthProvider>
       </body>
     </html>

@@ -5,29 +5,28 @@ import { BreadcrumbItem, BreadcrumbLink, BreadcrumbPage } from '@/components/sha
 import { getModelById, getModelByIdWithSourceSets } from '@/lib/db/model';
 import { getSourceRelease } from '@/lib/db/source';
 import { makeAuthedUserFromSessionOrReturnNull } from '@/lib/db/user';
-import { getLayerNumAsStringFromSource } from '@/lib/utils/source';
+import { getLayerNumAsStringFromSource, NEURONS_RELEASE } from '@/lib/utils/source';
 import { SourceReleaseWithRelations } from '@/prisma/generated/zod';
 import { Metadata } from 'next';
 import { notFound } from 'next/navigation';
 import GemmaScope2Home from './gemmascope-2/home';
 import GemmaScopeHome from './gemmascope/home';
 import PageModel from './page-model';
+import PageNeurons from './page-neurons';
 import PageRelease from './page-release';
 
-export async function generateMetadata(
-  props: {
-    params: Promise<{ modelId: string }>;
-    searchParams: Promise<{
-      q?: string;
-      selectedLayers?: string;
-      filter?: string;
-      sortIndex?: string;
-      sortIndexes?: string;
-      sourceSet?: string;
-      ignoreBos?: string;
-    }>;
-  }
-): Promise<Metadata> {
+export async function generateMetadata(props: {
+  params: Promise<{ modelId: string }>;
+  searchParams: Promise<{
+    q?: string;
+    selectedLayers?: string;
+    filter?: string;
+    sortIndex?: string;
+    sortIndexes?: string;
+    sourceSet?: string;
+    ignoreBos?: string;
+  }>;
+}): Promise<Metadata> {
   const searchParams = await props.searchParams;
   const params = await props.params;
   if (params.modelId === 'gemma-scope') {
@@ -84,20 +83,18 @@ export async function generateMetadata(
   };
 }
 
-export default async function Page(
-  props: {
-    params: Promise<{ modelId: string }>;
-    searchParams: Promise<{
-      q?: string;
-      selectedLayers?: string;
-      filter?: string;
-      sortIndex?: string;
-      sortIndexes?: string;
-      sourceSet?: string;
-      ignoreBos?: string;
-    }>;
-  }
-) {
+export default async function Page(props: {
+  params: Promise<{ modelId: string }>;
+  searchParams: Promise<{
+    q?: string;
+    selectedLayers?: string;
+    filter?: string;
+    sortIndex?: string;
+    sortIndexes?: string;
+    sourceSet?: string;
+    ignoreBos?: string;
+  }>;
+}) {
   const searchParams = await props.searchParams;
   const params = await props.params;
   const { modelId } = params;
@@ -135,6 +132,9 @@ export default async function Page(
     }
     if (release.name === 'gemma-scope-2') {
       return <GemmaScope2Home release={release} />;
+    }
+    if (release.name === NEURONS_RELEASE) {
+      return <PageNeurons release={release} />;
     }
     // CASE: Release page
     return <PageRelease release={release as SourceReleaseWithRelations} />;

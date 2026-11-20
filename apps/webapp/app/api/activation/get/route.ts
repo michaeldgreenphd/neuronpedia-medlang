@@ -1,10 +1,8 @@
+import { ApiError } from '@/lib/api-error';
+import { getActivationsForFeature } from '@/lib/db/neuron-dashboard';
 import { ERROR_NOT_FOUND_MESSAGE } from '@/lib/db/userCanAccess';
-import { PUBLIC_ACTIVATIONS_USER_IDS } from '@/lib/env';
 import { RequestOptionalUser, withOptionalUser } from '@/lib/with-user';
-import { PrismaClient } from '@prisma/client';
 import { NextResponse } from 'next/server';
-
-const prisma = new PrismaClient();
 
 /**
 @swagger
@@ -60,26 +58,17 @@ export const POST = withOptionalUser(async (request: RequestOptionalUser) => {
       return NextResponse.json({ error: 'Missing required parameters' }, { status: 400 });
     }
 
-    const activations = await prisma.activation.findMany({
-      where: {
-        modelId,
-        layer: source,
-        index,
-        creatorId: {
-          in: PUBLIC_ACTIVATIONS_USER_IDS,
-        },
-      },
-      orderBy: {
-        maxValue: 'desc',
-      },
-    });
-
-    if (!activations || activations.length === 0) {
+    const loaded = await getActivationsForFeature({ modelId, layer: source, index: String(index) });
+    const activations = loaded.activations.toSorted((a, b) => b.maxValue - a.maxValue);
+    if (!loaded.dashboard && activations.length === 0) {
       return NextResponse.json({ error: ERROR_NOT_FOUND_MESSAGE }, { status: 404 });
     }
 
     return NextResponse.json(activations);
   } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      return NextResponse.json({ error: ERROR_NOT_FOUND_MESSAGE }, { status: 404 });
+    }
     console.error('Error fetching activations:', error);
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }

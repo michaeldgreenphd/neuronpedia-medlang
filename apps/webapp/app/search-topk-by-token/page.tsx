@@ -2,11 +2,7 @@ import BreadcrumbsComponent from '@/components/breadcrumbs-component';
 import SearchTopkByTokenPane from '@/components/panes/search-topk-by-token-pane';
 import { BreadcrumbLink } from '@/components/shadcn/breadcrumbs';
 
-export default async function Page(
-  props: {
-    searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
-  }
-) {
+export default async function Page(props: { searchParams: Promise<{ [key: string]: string | string[] | undefined }> }) {
   const searchParams = await props.searchParams;
   const modelId = typeof searchParams.modelId === 'string' ? searchParams.modelId : undefined;
   const source = typeof searchParams.source === 'string' ? searchParams.source : undefined;
@@ -22,7 +18,7 @@ export default async function Page(
     sortByParam === 'frequency' || sortByParam === 'strength' || sortByParam === 'density' ? sortByParam : undefined;
 
   return (
-    <div className="flex h-full w-full flex-col items-center justify-center sm:max-h-[calc(100vh-80px)]">
+    <div className="flex h-full w-full flex-col items-center justify-center sm:h-[calc(100vh-80px)] sm:max-h-[calc(100vh-80px)]">
       <BreadcrumbsComponent
         crumbsArray={[
           <BreadcrumbLink href="/search-topk-by-token" key={1}>
@@ -37,7 +33,7 @@ export default async function Page(
             : []),
         ]}
       />
-      <div className="mt-3 flex w-full max-w-screen-xl flex-col items-center overflow-y-scroll sm:h-full">
+      <div className="mt-3 flex w-full max-w-screen-xl flex-col items-center overflow-y-scroll sm:min-h-0 sm:flex-1">
         <SearchTopkByTokenPane
           modelId={modelId || ''}
           source={source || ''}

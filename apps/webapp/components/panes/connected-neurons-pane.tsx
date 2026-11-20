@@ -3,6 +3,8 @@
 import FeatureDashboard from '@/app/[modelId]/[layer]/[index]/feature-dashboard';
 import { useGlobalContext } from '@/components/provider/global-provider';
 import { HoverCard, HoverCardContent, HoverCardTrigger } from '@/components/shadcn/hover-card';
+import type { TraceNode } from '@/lib/api/sparsity-types';
+import { getFeaturePath } from '@/lib/utils/neuron-identifier';
 import { getSourceSetNameFromSource } from '@/lib/utils/source';
 import { NeuronWithPartialRelations } from '@/prisma/generated/zod';
 import * as Select from '@radix-ui/react-select';
@@ -15,16 +17,6 @@ import { LoadingSquare } from '../svg/loading-square';
 type ResidChannel = {
   id: string;
   index: number;
-};
-
-type TraceNode = {
-  layer: number;
-  neuron: number;
-  read_weight: number;
-  via_channel: number;
-  write_weight: number;
-  children?: TraceNode[] | null;
-  parents?: TraceNode[] | null;
 };
 
 type ConnectedNeuron = {
@@ -803,7 +795,10 @@ export default function ConnectedNeuronsPane({
           minHeight: `${
             isLoading || !sparsityData
               ? 320
-              : Math.max(320, layerLabelPositions.length > 0 ? layerLabelPositions[layerLabelPositions.length - 1].maxY + 30 : 320)
+              : Math.max(
+                  320,
+                  layerLabelPositions.length > 0 ? layerLabelPositions[layerLabelPositions.length - 1].maxY + 30 : 320,
+                )
           }px`,
         }}
       >
@@ -1205,7 +1200,7 @@ export default function ConnectedNeuronsPane({
                                       <div key={`writer-${n.neuron}`} className="mb-1 ml-2">
                                         <div className="text-[10px] font-medium">
                                           <Link
-                                            href={`/${currentNeuron?.modelId}/${n.layer}-mlp/${n.neuron}`}
+                                            href={getFeaturePath(currentNeuron?.modelId, `${n.layer}-mlp`, n.neuron)}
                                             className="font-mono text-sky-700 hover:underline"
                                           >
                                             {n.layer}-MLP @ {n.neuron}
@@ -1260,7 +1255,7 @@ export default function ConnectedNeuronsPane({
                                       <div key={`reader-${n.neuron}`} className="mb-1 ml-2">
                                         <div className="text-[10px] font-medium">
                                           <Link
-                                            href={`/${currentNeuron?.modelId}/${n.layer}-mlp/${n.neuron}`}
+                                            href={getFeaturePath(currentNeuron?.modelId, `${n.layer}-mlp`, n.neuron)}
                                             className="font-mono text-sky-700 hover:underline"
                                           >
                                             {n.layer}-MLP @ {n.neuron}
@@ -1313,7 +1308,11 @@ export default function ConnectedNeuronsPane({
                                           {/* Layer {layerData.layer.split('-')[0]}
                                           {' - '} */}
                                           <Link
-                                            href={`/${currentNeuron?.modelId}/${layerData.layer}/${channel.index}`}
+                                            href={getFeaturePath(
+                                              currentNeuron?.modelId,
+                                              layerData.layer,
+                                              channel.index,
+                                            )}
                                             className="font-mono text-sky-700 hover:underline"
                                           >
                                             {layerData.layer} @ {channel.index}
@@ -1753,7 +1752,7 @@ export default function ConnectedNeuronsPane({
                       <HoverCard openDelay={300} closeDelay={400}>
                         <HoverCardTrigger asChild>
                           <Link
-                            href={`/${currentNeuron?.modelId}/${neuron.layer}-mlp/${neuron.index}`}
+                            href={getFeaturePath(currentNeuron?.modelId, `${neuron.layer}-mlp`, neuron.index)}
                             aria-label={`Go to neuron ${neuron.layer}-MLP @ ${neuron.index}`}
                             className={`absolute block h-3 w-3 rounded-full border transition-colors ${bgColor} ${borderColor}`}
                             style={{
@@ -1796,7 +1795,7 @@ export default function ConnectedNeuronsPane({
                           {/* Original tooltip content */}
                           <div className="px-3 py-3 text-xs text-slate-600">
                             <Link
-                              href={`/${currentNeuron?.modelId}/${neuron.layer}-mlp/${neuron.index}`}
+                              href={getFeaturePath(currentNeuron?.modelId, `${neuron.layer}-mlp`, neuron.index)}
                               className="flex flex-row items-center gap-x-1 font-mono text-xs font-bold uppercase text-sky-700 hover:underline"
                             >
                               {neuron.layer}-MLP @ {neuron.index} <ExternalLinkIcon className="h-3 w-3" />
@@ -1844,7 +1843,7 @@ export default function ConnectedNeuronsPane({
                             {neuron.resChannels.map((channel) => (
                               <div key={channel.id} className="mb-1 font-mono text-[10px] font-medium">
                                 <Link
-                                  href={`/${currentNeuron?.modelId}/${neuron.layer}-resid/${channel.index}`}
+                                  href={getFeaturePath(currentNeuron?.modelId, `${neuron.layer}-resid`, channel.index)}
                                   className="ml-2 uppercase text-sky-700 hover:underline"
                                 >
                                   {neuron.layer}-resid @ {channel.index}

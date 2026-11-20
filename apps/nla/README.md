@@ -29,7 +29,38 @@ SECRET=my-secret uv run server.py
 NLA_RECONSTRUCTOR_MODEL="" NLA_SOURCE_MODEL="" uv run server.py
 ```
 
-Server starts on **port 5009**. The verbalizer model loads via `sgl.Engine` in-process — no separate SGLang server needed.
+Server starts on **port 5009**.
+
+### Verbalizer backend (one class, any engine backend)
+
+The verbalizer runs on **[`interp-engine`](https://github.com/decoderesearch/interp-engine)**'s
+model protocol: `verbalizer.Verbalizer` splices the activation into the prompt embeddings and
+generates through `InterpModel.generate_steps_from_embeds`, which every engine backend
+implements. `NLA_VERBALIZER_BACKEND` picks the library:
+
+- **`auto`** (default) → `vllm` on a CUDA device, `eager` everywhere else.
+- **`vllm`** → the engine's graph-replaying vLLM engine with `prompt_embeds` on. CUDA only.
+- **`eager`** → plain `transformers` on CUDA, MPS or CPU (dev/test parity, not production throughput).
+- **`mlx`** → Apple's MLX through mlx-lm, on a Mac's GPU. Named only, never chosen by `auto`.
+- **`sglang`** → the legacy in-process `sgl.Engine` path (`NLAClient`). You must install `sglang`
+  yourself in a compatible env — it pins `transformers<5` and conflicts with vLLM / the engine, so
+  it is intentionally **not** in `pyproject.toml`.
+
+The **reconstructor** and **source** models stay on plain `transformers`: they are
+single-forward encoders/extractors (not autoregressive generators), so vLLM adds no
+benefit.
+
+> ⚠️ Many of the tuning / quantization / multi-GPU sections below describe the
+> **legacy sglang** verbalizer. On the vLLM backend the verbalizer runs
+> **non-eager, so CUDA graphs + inductor `torch.compile` are ON by default** (vLLM
+> bundles both). Env mapping:
+> - `NLA_MEM_FRACTION` → vLLM `gpu_memory_utilization`
+> - `NLA_KV_CACHE_DTYPE` → vLLM `kv_cache_dtype` (fp8 KV memory win); pre-quantized
+>   FP8 verbalizer checkpoints are auto-detected by vLLM
+> - `NLA_CUDA_GRAPH_MAX_BS` → caps/extends vLLM's CUDA-graph capture batch sizes to
+>   the fan-out (vLLM captures up to 256 by default)
+> - `NLA_VERBALIZER_ENFORCE_EAGER=1` → disable graphs + compile (debug/compat). There
+>   is no separate `--torch-compile` toggle — compile is bundled into the non-eager path.
 
 CLI args override env vars:
 
@@ -59,11 +90,19 @@ uv run server.py --port 8080 --max-concurrent 32 --mem-fraction 0.45 \
 
 ## Endpoints
 
-All endpoints require an `X-SECRET-KEY` header if `SECRET` is set.
+All endpoints require an `X-SECRET-KEY` header if `SECRET` is set, `/docs` and `/health` included.
+
+### `GET /health`
+
+Health check for monitors. Runs one token through the verbalizer on the same path `/describe` uses, and answers 200 with `"status": "ok"` only when that works. Otherwise it answers 503: `"status": "starting"` while the models load, or `"status": "unhealthy"` with an `error` (dead vLLM engine, poisoned CUDA context, or a probe that did not finish in `HEALTH_PROBE_TIMEOUT` seconds, default 20). The body is the `GET /` report plus `probe_ms`, `error` and per-GPU `gpus` memory.
+
+```bash
+curl -H "X-SECRET-KEY: $SECRET" http://localhost:5009/health
+```
 
 ### `GET /`
 
-Health check. The response reports the active configuration so callers can detect quantization / truncation state without scraping logs.
+Configuration report. Does not touch the GPU. The response reports the active configuration so callers can detect quantization / truncation state without scraping logs.
 
 ```bash
 curl http://localhost:5009/
@@ -769,8 +808,8 @@ source = SourceModel(
     "Qwen/Qwen2.5-7B-Instruct",
     layer_index=20,
     device="cuda",
-    truncate=True,    # drop layers past 20 + lm_head + final norm
-    fp8=True,         # torchao Float8WeightOnly
+    truncate=True,  # drop layers past 20 + lm_head + final norm
+    fp8=True,  # torchao Float8WeightOnly
 )
 tokens = source.extract("The capital of France is Paris")
 v = np.array(tokens[0]["activation"], dtype=np.float32)
@@ -780,7 +819,7 @@ client = NLAClient(
     "kitft/nla-qwen2.5-7b-actor-step4200",
     embed_device="cuda",
     mem_fraction_static=0.45,
-    quantization="fp8",   # Hopper+ only; omit/None on Ampere
+    quantization="fp8",  # Hopper+ only; omit/None on Ampere
 )
 description = client.generate(v)
 
@@ -788,7 +827,7 @@ description = client.generate(v)
 reconstructor = NLAReconstructor(
     "kitft/nla-qwen2.5-7b-critic-step4200",
     device="cuda",
-    fp8=True,             # FP8 backbone via torchao; value_head stays bf16
+    fp8=True,  # FP8 backbone via torchao; value_head stays bf16
 )
 mse, cos = reconstructor.score(description, v)
 
@@ -799,6 +838,33 @@ client.shutdown()
 `SourceModel(..., truncate=True)` fails-loud on `/completion` semantics — `model.generate()` will produce garbage from the `Identity` lm_head — so don't use a truncated `SourceModel` for completion in custom code. Use `truncate=False` if you need both extraction and generation.
 
 ## Troubleshooting
+
+### `CUDA driver is too old for this PyTorch build`
+
+The server refuses to start with something like:
+
+```
+CUDA driver is too old for this PyTorch build: the driver supports CUDA 12.8,
+but torch 2.11.0+cu130 needs CUDA 13.0.
+```
+
+The wheels here are CUDA 13 (torch cu130, and the engine's vLLM links `libcudart.so.13`),
+so a host still on a 12.x driver can't run them. The error prints the fix, which is the
+NVIDIA forward-compat driver — a newer user-mode driver over the host's older kernel
+driver, supported on datacenter GPUs:
+
+```bash
+apt-get install -y cuda-compat-13-0
+export LD_LIBRARY_PATH=/usr/local/cuda-13.0/compat:$LD_LIBRARY_PATH
+```
+
+`LD_LIBRARY_PATH` has to be set before launching — the dynamic loader reads it at exec, so
+the server can't set it for itself. This check (`check_cuda_driver` in the engine) runs
+before the first CUDA call precisely because `torch.cuda.is_available()` does *not* raise on
+a too-old driver: it answers False, which would otherwise demote the whole server to CPU
+with no explanation. To run on CPU deliberately on such a box, set `NLA_VERBALIZER_DEVICE`,
+`NLA_RECONSTRUCTOR_DEVICE`, and `NLA_SOURCE_DEVICE` to `cpu` (the CLI `--*-device` flags are
+parsed too late to be seen by the check).
 
 ### `sgl_kernel` import error / `libnuma.so.1` not found
 

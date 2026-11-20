@@ -3,6 +3,7 @@ import { ipAddress } from '@vercel/functions';
 import { kv } from '@vercel/kv';
 import { NextRequest, NextResponse } from 'next/server';
 import { API_KEY_HEADER_NAME, CONTACT_EMAIL_ADDRESS, ENABLE_RATE_LIMITER, HIGHER_LIMIT_API_TOKENS } from './lib/env';
+import { getLegacyModelIdRedirect } from './lib/utils/legacy-model-id';
 
 const RATE_LIMIT_WINDOW = '60 m';
 
@@ -24,15 +25,22 @@ const NORMAL_RATE_LIMITS: RateLimitEntry[] = [
   { endpoint: '/api/activation/new', limit: 1000 },
   { endpoint: '/api/explanation/search', limit: 200 },
   { endpoint: '/api/explanation/score', limit: 120, exact: true },
-  { endpoint: '/api/steer', limit: 120 },
+  { endpoint: '/api/feature/interpretable', limit: 120, exact: true },
+  { endpoint: '/api/steer', limit: 240 },
   { endpoint: '/api/search-topk-by-token', limit: 500 },
   { endpoint: '/api/search-all', limit: 1600 },
   { endpoint: '/api/graph/generate', limit: 30 },
+  { endpoint: '/api/lens/prompt', limit: 240, exact: true },
+  { endpoint: '/api/lens/oracle', limit: 600, exact: true },
+  { endpoint: '/api/lens/share', limit: 30, exact: true },
   { endpoint: '/api/features/upload-batch', limit: 1000 },
   { endpoint: '/api/model/new', limit: 5 },
   { endpoint: '/api/source-set/new', limit: 10 },
   { endpoint: '/api/graph/tokenize', limit: 300 },
+  { endpoint: '/api/graph/parse-chat-prompt', limit: 300 },
   { endpoint: '/api/auth/signin', limit: 5 },
+  // Gmail and Yahoo one-click unsubscribes come from a few shared mail-server IPs.
+  { endpoint: '/api/email/unsubscribe', limit: 500, exact: true },
   { endpoint: '/api/explorer/url-metadata', limit: 120 },
   { endpoint: '/api/explorer/node/submit-urls', limit: 30 },
   { endpoint: '/api/explorer/node/new', limit: 60 },
@@ -67,15 +75,21 @@ const HIGHER_RATE_LIMITS: RateLimitEntry[] = [
   { endpoint: '/api', limit: 25000 },
   { endpoint: '/api/activation/new', limit: 3000 }, // higher
   { endpoint: '/api/explanation/search', limit: 3000 }, // higher
+  { endpoint: '/api/feature/interpretable', limit: 480, exact: true }, // higher
   { endpoint: '/api/steer', limit: 1000 }, // higher
   { endpoint: '/api/search-topk-by-token', limit: 1200 }, // higher
   { endpoint: '/api/search-all', limit: 1600 },
   { endpoint: '/api/graph/generate', limit: 320 }, // higher
+  { endpoint: '/api/lens/prompt', limit: 480, exact: true }, // higher
+  { endpoint: '/api/lens/oracle', limit: 1200, exact: true }, // higher
+  { endpoint: '/api/lens/share', limit: 100, exact: true }, // higher
   { endpoint: '/api/features/upload-batch', limit: 1000 },
   { endpoint: '/api/model/new', limit: 5 },
   { endpoint: '/api/source-set/new', limit: 10 },
   { endpoint: '/api/graph/tokenize', limit: 300 },
+  { endpoint: '/api/graph/parse-chat-prompt', limit: 300 },
   { endpoint: '/api/auth/signin', limit: 5 },
+  { endpoint: '/api/email/unsubscribe', limit: 500, exact: true },
   { endpoint: '/api/saelens/latent-decoder', limit: 3600 },
   { endpoint: '/api/nla/explain-saelens', limit: 120 },
   { endpoint: '/api/nla/completion', limit: 240 },
@@ -128,6 +142,11 @@ export default async function middleware(request: NextRequest) {
   const isEmbedSearchParam = request.nextUrl.searchParams.get('embed');
   const isEmbed = isEmbedSearchParam === 'true' || pathname.startsWith('/embed/');
   requestHeaders.set('x-is-embed', isEmbed ? 'true' : 'false');
+
+  const legacyModelIdRedirect = getLegacyModelIdRedirect(request.nextUrl.pathname, request.nextUrl.searchParams);
+  if (legacyModelIdRedirect) {
+    return NextResponse.redirect(new URL(legacyModelIdRedirect, request.url));
+  }
 
   if (!ENABLE_RATE_LIMITER) {
     const res = NextResponse.next({
@@ -194,3 +213,8 @@ export default async function middleware(request: NextRequest) {
   }
   return res;
 }
+
+// Static files skip the rate limiter, so they do not use up a visitor's limit or call Redis.
+export const config = {
+  matcher: ['/((?!_next/static|_next/image|favicon\\.ico|.*\\.(?:png|jpg|jpeg|gif|svg|webp|ico|woff2?)$).*)'],
+};

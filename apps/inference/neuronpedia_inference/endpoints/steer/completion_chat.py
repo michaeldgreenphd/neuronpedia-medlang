@@ -3,123 +3,107 @@ import os
 import time
 from typing import Any
 
+import numpy as np
 import torch
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from neuronpedia_inference_client.models.np_logprob import NPLogprob
-from neuronpedia_inference_client.models.np_steer_chat_message import NPSteerChatMessage
-from neuronpedia_inference_client.models.np_steer_chat_result import NPSteerChatResult
-from neuronpedia_inference_client.models.np_steer_feature import NPSteerFeature
-from neuronpedia_inference_client.models.np_steer_method import NPSteerMethod
-from neuronpedia_inference_client.models.np_steer_type import NPSteerType
-from neuronpedia_inference_client.models.np_steer_vector import NPSteerVector
-from neuronpedia_inference_client.models.steer_completion_chat_post200_response import (
-    SteerCompletionChatPost200Response,
+from interp_engine import (
+    InterpModel,
+    SamplingSettings,
+    SteeringSpec,
+    SteerMask,
+    compose_assistant_turns,
+    strip_wire_reasoning,
 )
-from neuronpedia_inference_client.models.steer_completion_chat_post200_response_assistant_axis_inner import (
-    SteerCompletionChatPost200ResponseAssistantAxisInner,
-)
-from neuronpedia_inference_client.models.steer_completion_chat_post200_response_assistant_axis_inner_turns_inner import (
-    SteerCompletionChatPost200ResponseAssistantAxisInnerTurnsInner,
-)
-from neuronpedia_inference_client.models.steer_completion_chat_post_request import (
-    SteerCompletionChatPostRequest,
-)
-from nnterp import StandardizedTransformer
-from transformer_lens import HookedTransformer
 
 from neuronpedia_inference.config import Config
-from neuronpedia_inference.endpoints.persona.monitor import (
-    _truncate_content,
-    pc_projection,
+from neuronpedia_inference.endpoints.steer.completion import (
+    _generate_text,
+    features_to_steering_specs,
+    resolve_max_new_tokens,
+    steer_write_targets,
 )
-from neuronpedia_inference.endpoints.persona.utils import (
-    DEFAULT_LAYER,
-    ROLE_PC_TITLES,
-    ConversationEncoder,
-    PersonaData,
-    ProbingModelChatSpace,
-    SpanMapperChatSpace,
+from neuronpedia_inference.engine_adapter import (
+    BackendUnsupported,
+    assert_capture_layers_declared,
+    assert_steer_layers_declared,
+    assert_steering_available,
+    declares_static_taps,
+)
+from neuronpedia_inference.inference_utils.sampling import (
+    resolve_request_sampling,
+    sampling_report,
+    state_settings_once,
 )
 from neuronpedia_inference.inference_utils.steering import (
-    OrthogonalProjector,
-    apply_generic_chat_template,
-    convert_to_chat_array,
+    NeuronSteerError,
+    SteeringSettings,
     format_sse_message,
     process_features_vectorized,
+    refuse_split_neuron_steer,
     remove_sse_formatting,
+    stop_when_client_leaves,
     stream_lock,
 )
+from neuronpedia_inference.inference_utils.token_limit import reject_if_over_token_limit
+from neuronpedia_inference.inference_utils.vectors import (
+    CaptureKey,
+    RenderConditions,
+    TokenSelection,
+    VectorAsset,
+    VectorRequestError,
+    project_vector_with_percentile,
+    resolve_request_reads,
+    truncate_content,
+)
+from neuronpedia_inference.inference_utils.vectors.capture_engine import capture_turn_means
 from neuronpedia_inference.inference_utils.vllm_monitor import get_monitor
-from neuronpedia_inference.nnsight_health import watch_async_iter
-from neuronpedia_inference.sae_manager import SAEManager
+from neuronpedia_inference.memory_cost import steer_cost
+from neuronpedia_inference.schemas import (
+    NPLogprob,
+    NPSteerChatMessage,
+    NPSteerChatResult,
+    NPSteerType,
+    SteerCompletionChatRequest,
+    SteerCompletionChatResponse,
+    SteerReadoutTurn,
+    SteerVectorReadout,
+)
 from neuronpedia_inference.shared import Model, with_request_lock
-from neuronpedia_inference.utils import make_logprob_from_logits
-
-# vLLM/chatspace only available on Linux
-try:
-    from chatspace.generation import VLLMSteerModel
-    from chatspace.generation.vllm_steer_model import (
-        AddSpec,
-        LayerSteeringSpec,
-        ProjectionCapSpec,
-        SteeringOp,
-        SteeringSpec,
-    )
-    from vllm import SamplingParams
-
-    VLLM_AVAILABLE = True
-except ImportError:
-    VLLM_AVAILABLE = False
-    VLLMSteerModel = None  # type: ignore[misc, assignment]
-    SamplingParams = None  # type: ignore[misc, assignment]
-    AddSpec = None  # type: ignore[misc, assignment]
-    LayerSteeringSpec = None  # type: ignore[misc, assignment]
-    ProjectionCapSpec = None  # type: ignore[misc, assignment]
-    SteeringOp = None  # type: ignore[misc, assignment]
-    SteeringSpec = None  # type: ignore[misc, assignment]
 
 logger = logging.getLogger(__name__)
+
+# A base model has no chat template, and this endpoint used to paper over that with a
+# generic ChatML render. That produced a 200 carrying the prompt parroted back with
+# `<|im_start|>` markers the model has never seen — a failure indistinguishable from
+# success unless you read the output. Refusing sends the caller to the route that fits
+# the model, which is what the UI already picks for a non-instruct model.
+#
+# The verdict comes from the engine rather than from `tokenizer.chat_template`, so a model
+# that defines its chat format in code (DeepSeek-V4) is served rather than refused.
+NO_CHAT_TEMPLATE_ERROR = (
+    "This model has no chat template, so it cannot accept chat messages. "
+    "Use /v1/steer/completion with a raw `prompt` instead."
+)
 
 # Enable background health monitoring if env var is set
 ENABLE_BACKGROUND_MONITOR = os.environ.get("ENABLE_VLLM_MONITOR", "0") == "1"
 MONITOR_INTERVAL = float(os.environ.get("VLLM_MONITOR_INTERVAL", "30"))
 
-ASSISTANT_AXIS_ALLOWED_MODELS = ["meta-llama/Meta-Llama-3.3-70B-Instruct"]
-
-
-def _get_feature_layer_for_nnsight(
-    feature: NPSteerFeature | NPSteerVector, sae_manager: SAEManager
-) -> int:
-    """Get the layer number for sorting features in nnsight (must be accessed in order)."""
-    hook_name = (
-        sae_manager.get_sae_hook(feature.source)
-        if isinstance(feature, NPSteerFeature)
-        else feature.hook
-    )
-    # Extract layer from hook_name like "blocks.0.hook_resid_post"
-    return int(hook_name.split(".")[1])
-
 
 router = APIRouter()
-
-TOKENS_PER_YIELD = 1
 
 
 @router.get("/steer/health")
 async def health_check():
     """
-    Get health stats for the vLLM engine.
+    Get health stats for the loaded engine.
 
     Returns GPU memory usage, system RAM, active requests, threads, etc.
     Useful for debugging hanging requests.
     """
-    model = Model.get_instance()
     monitor = get_monitor()
-
-    # Set the model if it's a VLLMSteerModel
-    if VLLM_AVAILABLE and isinstance(model, VLLMSteerModel):
-        monitor.set_model(model)
+    monitor.set_model(Model.get_instance())
 
     stats = await monitor.get_stats()
     return JSONResponse(
@@ -130,204 +114,236 @@ async def health_check():
     )
 
 
-def _get_feature_layer_for_nnsight(
-    feature: NPSteerFeature | NPSteerVector, sae_manager: SAEManager
-) -> int:
-    """Get the layer number for sorting features in nnsight (must be accessed in order)."""
-    hook_name = (
-        sae_manager.get_sae_hook(feature.source)
-        if isinstance(feature, NPSteerFeature)
-        else feature.hook
-    )
-    # Extract layer from hook_name like "blocks.0.hook_resid_post"
-    return int(hook_name.split(".")[1])
+def messages_for_render(promptChat: list[NPSteerChatMessage], *, blank_system_prompt: bool) -> list[dict[str, str]]:
+    """The request messages as the chat template should see them.
+
+    Distinct from ``promptChat``, which is echoed back to the client verbatim: this is only
+    what the model reads, so the returned transcript and the stored row stay faithful to what
+    was generated while the prompt drops what shouldn't be re-rendered.
+
+    Prior-turn reasoning is what gets dropped. Composition folds it into the message as
+    ``<think>...</think>`` so the client can render it, but harmony's convention is to discard
+    earlier analysis and ``<think>`` is not one of its delimiters — re-rendering it would put
+    literal tag text inside a ``final``-channel block. Reasoning-tag families would merely pay
+    the context window for it.
+    """
+    rendered: list[dict[str, str]] = []
+    for index, message in enumerate(promptChat):
+        content = "" if (index == 0 and blank_system_prompt) else message.content
+        if message.role == "assistant":
+            content = strip_wire_reasoning(content)
+            if not content:
+                # A turn that was nothing but reasoning has nothing left to render. Dropping it
+                # beats rendering an empty assistant turn the model would try to continue.
+                continue
+        rendered.append({"role": message.role, "content": content})
+    return rendered
 
 
-def _get_feature_layer_for_nnsight(
-    feature: NPSteerFeature | NPSteerVector, sae_manager: SAEManager
-) -> int:
-    """Get the layer number for sorting features in nnsight (must be accessed in order)."""
-    hook_name = (
-        sae_manager.get_sae_hook(feature.source)
-        if isinstance(feature, NPSteerFeature)
-        else feature.hook
-    )
-    # Extract layer from hook_name like "blocks.0.hook_resid_post"
-    return int(hook_name.split(".")[1])
-
-
-@router.post("/steer/completion-chat")
-@with_request_lock()
-async def completion_chat(request: SteerCompletionChatPostRequest):
+@router.post("/steer/completion-chat", responses={200: {"model": SteerCompletionChatResponse}})
+@with_request_lock(exclusive=False, cost=steer_cost)
+async def completion_chat(request: SteerCompletionChatRequest, http_request: Request):
     request_start = time.time()
     model = Model.get_instance()
     config = Config.get_instance()
     steer_method = request.steer_method
     normalize_steering = request.normalize_steering
     steer_special_tokens = request.steer_special_tokens
-    custom_hf_model_id = config.custom_hf_model_id
 
-    # Start background monitoring if enabled (once) for VLLMSteerModel
-    if (
-        ENABLE_BACKGROUND_MONITOR
-        and VLLM_AVAILABLE
-        and isinstance(model, VLLMSteerModel)
-    ):
+    # Start background monitoring if enabled (once).
+    if ENABLE_BACKGROUND_MONITOR:
         monitor = get_monitor()
         monitor.set_model(model)
         if monitor._background_task is None:
             monitor.start_background_logging(interval=MONITOR_INTERVAL)
 
-    # if is_assistant_axis is true, then we also send the persona monitor results, and add a system prompt for short responses
-    is_assistant_axis = (
-        request.is_assistant_axis if request.is_assistant_axis is not None else False
-    )
-
-    if is_assistant_axis:
-        if not VLLM_AVAILABLE or not isinstance(model, VLLMSteerModel):
-            return JSONResponse(
-                content={
-                    "error": "Assistant axis is only supported for Chatspace/VLLMSteer model (Linux only)"
-                },
-                status_code=400,
+    # Every vector this request wants read comes with it: this server ships none, so there is
+    # nothing to resolve a name against.
+    reads: list[VectorAsset] = []
+    if request.reads:
+        try:
+            reads = await resolve_request_reads(
+                request.reads,
+                hidden_size=int(model.d_model),
+                n_layers=int(model.n_layers),
             )
+        except VectorRequestError as exc:
+            # Returned verbatim, and safe to: every message this can carry is a literal written in
+            # `vector_request`, naming the vector and the field that was wrong. The upstream text that
+            # used to be interpolated into the Hub failures -- and with it this pod's cache paths --
+            # is logged there instead. Blanking the message would leave a caller who sent eight
+            # reads unable to tell which one this rejected, which is the whole point of the type.
+            logger.warning(f"Vector read rejected: {exc}", exc_info=True)
+            return JSONResponse(content={"error": str(exc)}, status_code=exc.status_code)
 
-    # Ensure exactly one of features or vector is provided
-    if (request.features is not None) == (request.vectors is not None):
-        logger.error(
-            "Invalid request data: exactly one of features or vectors must be provided"
-        )
+        # Asked before anything is rendered or generated. A static pod's tap set is fixed when its
+        # graphs are recorded, and a vector names its layer at request time, so this is the one
+        # mismatch that no startup check could have caught.
+        try:
+            assert_capture_layers_declared(
+                model,
+                [vector.layer for vector in reads],
+                f"Vector read {[vector.id for vector in reads]}",
+            )
+        except BackendUnsupported as exc:
+            return JSONResponse(content={"error": str(exc)}, status_code=400)
+
+    # Every requested vector has to agree about how the conversation is rendered, because those
+    # conditions are applied before generation and so change the text itself. There is no way to
+    # render one conversation two ways in a single generation, and honouring one vector's
+    # conditions while reporting another's numbers would quietly project onto a direction fitted
+    # off-distribution.
+    render, render_conflict = _agreed_render_conditions(reads)
+    if render_conflict is not None:
+        return JSONResponse(content={"error": render_conflict}, status_code=400)
+
+    # A steered generation needs the worker's write-hooks, and a GENERATION_ONLY pod has none: on
+    # that pod this would otherwise generate happily and return UNSTEERED text under a "STEERED"
+    # label, since a hook that never fires reports nothing. Conditional on the request, because an
+    # unsteered completion through this endpoint is exactly what such a pod is for.
+    #
+    # Deliberately not conditional on the reads: a readout needs capture hooks, not write hooks, so
+    # an unsteered readout is exactly what a generation-only pod can serve.
+    if NPSteerType.STEERED in request.types:
+        try:
+            assert_steering_available(model, "Steered generation")
+        except BackendUnsupported as e:
+            return JSONResponse(content={"error": str(e)}, status_code=400)
+
+    # Features or vectors are what steering steers with, so they are required only when something
+    # will be steered. A readout-only request (types=[DEFAULT], reads=[...]) legitimately carries
+    # neither, and demanding a placeholder would make the caller fake a steer to measure one.
+    wants_steering = NPSteerType.STEERED in request.types
+    if wants_steering and (request.features is not None) == (request.vectors is not None):
+        logger.error("Invalid request data: exactly one of features or vectors must be provided")
         return JSONResponse(
-            content={
-                "error": "Invalid request data: exactly one of features or vectors must be provided"
-            },
+            content={"error": "Invalid request data: exactly one of features or vectors must be provided"},
+            status_code=400,
+        )
+    if not wants_steering and request.features is not None and request.vectors is not None:
+        return JSONResponse(
+            content={"error": "Invalid request data: provide at most one of features or vectors"},
             status_code=400,
         )
 
     promptChat = request.prompt
-    promptChatFormatted = []
 
-    if is_assistant_axis:
-        # Check if first message is already a system message
-        if promptChat and promptChat[0].role == "system":
-            # Strip the default Llama system prompt if present and use blank content
-            # Llama system prompt should always be blank
-            promptChatFormatted.append({"role": "system", "content": ""})
-            # Add remaining messages (skip the first system message we already processed)
-            for message in promptChat[1:]:
-                promptChatFormatted.append(
-                    {"role": message.role, "content": message.content}
-                )
-        else:
-            # No existing system message, just add all messages as-is
-            for message in promptChat:
-                promptChatFormatted.append(
-                    {"role": message.role, "content": message.content}
-                )
-    else:
-        for message in promptChat:
-            promptChatFormatted.append(
-                {"role": message.role, "content": message.content}
-            )
+    # Blank a caller-supplied system prompt only when the requested reads were fitted that way —
+    # their directions are meaningless against activations from a conversation rendered
+    # differently. Gating on the assets (rather than on "a readout was requested") keeps us from
+    # silently discarding the system prompt of a model whose reads have no such requirement.
+    blank_system_prompt = bool(promptChat) and promptChat[0].role == "system" and render.blank_system_prompt
+
+    promptChatFormatted = messages_for_render(promptChat, blank_system_prompt=blank_system_prompt)
 
     if model.tokenizer is None:
         raise ValueError("Tokenizer is not initialized")
 
-    # If the tokenizer does not support chat templates, we need to apply a generic chat template
-    if (
-        not hasattr(model.tokenizer, "chat_template")
-        or model.tokenizer.chat_template is None
-    ):
-        logger.warning(
-            "Model's tokenizer does not support chat templates. Using generic chat template."
-        )
-        template_applied_prompt = apply_generic_chat_template(
-            promptChatFormatted, add_generation_prompt=True
-        )
-        if isinstance(model, HookedTransformer):
-            promptTokenized = model.to_tokens(
-                template_applied_prompt, prepend_bos=True
-            )[0]
-        elif isinstance(model, StandardizedTransformer) or (
-            VLLM_AVAILABLE and isinstance(model, VLLMSteerModel)
-        ):
-            promptTokenized = model.tokenizer(
-                template_applied_prompt, add_special_tokens=False, return_tensors="pt"
-            )["input_ids"][0]
-            if (request.n_logprobs is not None) and (request.n_logprobs > 0):
-                request.n_logprobs = 0
-    else:
-        # tokenize = True adds a BOS
-        promptTokenized = model.tokenizer.apply_chat_template(
-            promptChatFormatted, tokenize=True, add_generation_prompt=True
-        )
-        if isinstance(model, StandardizedTransformer) or (
-            VLLM_AVAILABLE and isinstance(model, VLLMSteerModel)
-        ):
-            if promptTokenized[0] == model.tokenizer.bos_token_id:
-                promptTokenized = promptTokenized[1:]
+    tok = model.tok
+    if not tok.has_chat_template():
+        return JSONResponse(content={"error": NO_CHAT_TEMPLATE_ERROR}, status_code=400)
+
+    # Render the prompt to a string, then tokenize to a flat list of ids. We render
+    # first (rather than apply_chat_template(tokenize=True)) because transformers 5
+    # returns a BatchEncoding from the tokenizing path; rendering + a plain tokenizer
+    # call is deterministic and backend-uniform. The rendered string already carries
+    # the model's special tokens, so add_special_tokens=False (no double BOS). Both
+    # backends' generation consumes the token ids directly.
+    #
+    # Rendered through the engine's `Tokenize`, not the tokenizer: that is the layer holding
+    # the code formatter for a family whose format is not a Jinja template.
+    # `render.template_kwargs` is whatever the fit pinned about the template itself. Llama 3.1
+    # injects the current date into the system block, so a vector fitted on it pins `date_string`
+    # and would otherwise drift off distribution as the calendar moves.
+    #
+    # Typed `dict[str, Any]` because the pinned names are the asset's, not ours: as `dict[str, str]`
+    # a pin that collides with a named parameter (`continue_final_message`) reads as a str-for-bool
+    # type error at every call site rather than at the one asset that would do it.
+    template_kwargs: dict[str, Any] = dict(render.template_kwargs)
+    rendered_prompt = tok.apply_chat_template(
+        promptChatFormatted,
+        tokenize=False,
+        add_generation_prompt=True,
+        **template_kwargs,
+    )
+    promptTokenized = model.tokenizer(rendered_prompt, add_special_tokens=False)["input_ids"]
+    # Normalize any nested [[...]] shape to 1D.
+    if promptTokenized and isinstance(promptTokenized[0], list):
+        promptTokenized = promptTokenized[0]
     promptTokenized = torch.tensor(promptTokenized)
 
     # logger.info("promptTokenized: %s", promptTokenized)
-    if len(promptTokenized) > config.token_limit:
-        logger.error(
-            "Text too long: %s tokens, max is %s",
-            len(promptTokenized),
-            config.token_limit,
-        )
-        return JSONResponse(
-            content={
-                "error": f"Text too long: {len(promptTokenized)} tokens, max is {config.token_limit}"
-            },
-            status_code=400,
-        )
+    too_long = reject_if_over_token_limit(len(promptTokenized), config.token_limit)
+    if too_long is not None:
+        return too_long
 
     if request.features is not None:
-        features = process_features_vectorized(request.features)
+        try:
+            features = process_features_vectorized(request.features)
+            refuse_split_neuron_steer(features, steer_method)
+        except NeuronSteerError as exc:
+            return JSONResponse(content={"error": str(exc)}, status_code=400)
     elif request.vectors is not None:
         features = request.vectors
+    elif not wants_steering:
+        # Nothing will be steered, so there is nothing to steer with.
+        features = []
     else:
         return JSONResponse(
             content={"error": "No features or vectors provided"},
             status_code=400,
         )
 
-    # Convert promptChatFormatted to NPSteerChatMessage for persona monitor
-    # This ensures persona monitor analyzes the same conversation (including system message) as generation
-    inputPromptForPersona = [
-        NPSteerChatMessage(role=msg["role"], content=msg["content"])
-        for msg in promptChatFormatted
-    ]
+    # The write-side twin of the vector-layer check above, and asked for the same reason: the spec
+    # that writes is built inside the SSE generator, so a refusal there is a 500 mid-stream. A
+    # projection cap writes wherever the vector it caps was fitted, which on this endpoint is not
+    # the layer the vector reads -- the 70B pod declared 40 for the readout and was asked to write 32.
+    if wants_steering and declares_static_taps(model):
+        try:
+            for point, layers in steer_write_targets(features).items():
+                assert_steer_layers_declared(model, layers, point=point)
+        except BackendUnsupported as exc:
+            return JSONResponse(content={"error": str(exc)}, status_code=400)
+
+    # Convert promptChatFormatted to NPSteerChatMessage for the readouts, so they analyze the
+    # same conversation (including the system message, blanked or not) that generation saw.
+    inputPromptForReads = [NPSteerChatMessage(role=msg["role"], content=msg["content"]) for msg in promptChatFormatted]
+
+    max_new_tokens, no_room = resolve_max_new_tokens(len(promptTokenized), int(request.n_completion_tokens))
+    if no_room is not None:
+        return no_room
 
     generation_start = time.time()
 
-    generator = watch_async_iter(
-        run_batched_generate(
-            promptTokenized=promptTokenized,
-            inputPrompt=inputPromptForPersona if is_assistant_axis else promptChat,
+    seed = int(request.seed)
+    sampling = resolve_request_sampling(model, request)
+    report = sampling_report(sampling, seed)
+    generator = run_batched_generate(
+        promptTokenized=promptTokenized,
+        inputPrompt=inputPromptForReads if reads else promptChat,
+        settings=SteeringSettings(
             features=features,
-            steer_types=request.types,
             strength_multiplier=float(request.strength_multiplier),
-            seed=int(request.seed),
-            temperature=float(request.temperature),
-            freq_penalty=float(request.freq_penalty),
-            max_new_tokens=int(request.n_completion_tokens),
-            steer_special_tokens=steer_special_tokens,
             steer_method=steer_method,
             normalize_steering=normalize_steering,
-            use_stream_lock=request.stream if request.stream is not None else False,
-            custom_hf_model_id=custom_hf_model_id,
-            n_logprobs=(request.n_logprobs or 0),
-            is_assistant_axis=is_assistant_axis,
-        )
+        ),
+        steer_types=request.types,
+        seed=seed,
+        sampling=sampling,
+        max_new_tokens=max_new_tokens,
+        steer_special_tokens=steer_special_tokens,
+        use_stream_lock=request.stream if request.stream is not None else False,
+        reads=reads,
     )
 
     if request.stream:
+        stated = state_settings_once(generator, report, SteerCompletionChatResponse)
+
         # For streaming, wrap the generator to add timing logs
         async def timed_generator():
             chunk_count = 0
             try:
-                async for item in generator:
+                async for item in stated:
                     chunk_count += 1
                     yield item
                 generation_time = time.time() - generation_start
@@ -337,14 +353,16 @@ async def completion_chat(request: SteerCompletionChatPostRequest):
                     f"~chunks={chunk_count}"
                 )
             except Exception:
-                logger.exception(
-                    f"[REQUEST ERROR] Error during generation after {time.time() - request_start:.2f}s"
-                )
+                logger.exception(f"[REQUEST ERROR] Error during generation after {time.time() - request_start:.2f}s")
                 raise
 
-        return StreamingResponse(timed_generator(), media_type="text/event-stream")
+        return StreamingResponse(
+            stop_when_client_leaves(timed_generator(), http_request, "STEER-CHAT"),
+            media_type="text/event-stream",
+        )
 
-    # for non-streaming request, get last item from generator
+    # For a non-streaming request, the last frame is the answer. The generators emit at least
+    # one frame per steer type, empty completion included.
     last_item = None
     chunk_count = 0
     async for item in generator:
@@ -353,1122 +371,434 @@ async def completion_chat(request: SteerCompletionChatPostRequest):
 
     generation_time = time.time() - generation_start
     total_time = time.time() - request_start
-    logger.info(
-        f"[REQUEST COMPLETE] total={total_time:.2f}s, generation={generation_time:.2f}s, "
-        f"~chunks={chunk_count}"
-    )
+    logger.info(f"[REQUEST COMPLETE] total={total_time:.2f}s, generation={generation_time:.2f}s, ~chunks={chunk_count}")
 
     if last_item is None:
         raise ValueError("No response generated")
     results = remove_sse_formatting(last_item)
-    response = SteerCompletionChatPost200Response.from_json(results)
-    if response is None:
-        raise ValueError("Failed to parse response")
+    response = SteerCompletionChatResponse.model_validate_json(results)
+    # The stream states its settings on the first frame; the one response states them here.
+    response.sampling = report
     # set exclude_none to True to omit the logprobs field when n_logprobs isn't set in the request, for backwards compatibility
     return JSONResponse(content=response.model_dump(exclude_none=True))
 
 
-async def run_persona_monitor(
-    model: Any,
-    conversation: list[NPSteerChatMessage],
-    steer_type: NPSteerType,
-    layer: int = DEFAULT_LAYER,
-    steering_spec: Any = None,
-) -> SteerCompletionChatPost200ResponseAssistantAxisInner | None:
-    """
-    Run persona monitoring on the conversation and return assistant_axis data.
+def _agreed_render_conditions(reads: list[VectorAsset]) -> tuple[RenderConditions, str | None]:
+    """The rendering conditions shared by every requested vector, or why there are none.
 
-    This extracts activations and projects them onto pre-computed principal components
-    that capture persona-related variation in the model's representations.
+    Returns the agreed conditions and ``None`` when the reads agree, or when none were requested
+    and so nothing about the prompt changes. Otherwise the second element names the
+    disagreement, which the endpoint turns into a 400: the conversation is rendered once and
+    generated from once, so honouring one vector's conditions while reporting another's numbers
+    would project onto a direction fitted off-distribution.
+    """
+    if not reads:
+        return RenderConditions(), None
+
+    by_conditions: dict[tuple, list[VectorAsset]] = {}
+    for vector in reads:
+        by_conditions.setdefault(vector.render.key(), []).append(vector)
+    if len(by_conditions) == 1:
+        return reads[0].render, None
+
+    groups = "; ".join(
+        f"[{', '.join(vector.id for vector in group)}] need ({group[0].render.describe()})"
+        for group in by_conditions.values()
+    )
+    return reads[0].render, (
+        "The requested vectors were fitted under different rendering conditions, so they "
+        f"cannot be measured in one generation: {groups}. Request them separately."
+    )
+
+
+async def _capture_means(
+    model: InterpModel,
+    conversation: list[NPSteerChatMessage],
+    keys: list[CaptureKey],
+    specs: list[SteeringSpec] | None,
+    template_kwargs: dict[str, str],
+) -> dict[CaptureKey, torch.Tensor]:
+    """One capture pass covering every key in ``keys``, steered when specs are given."""
+    if not keys:
+        return {}
+    return await capture_turn_means(model, conversation, keys, specs=specs, template_kwargs=template_kwargs)
+
+
+async def capture_read_means(
+    model: InterpModel,
+    conversation: list[NPSteerChatMessage],
+    keys: list[CaptureKey],
+    steering_specs: list[SteeringSpec] | None = None,
+    template_kwargs: dict[str, str] | None = None,
+) -> tuple[dict[CaptureKey, torch.Tensor], dict[CaptureKey, torch.Tensor] | None]:
+    """Per-message pooled activations for every capture the requested reads need.
+
+    One forward per condition, whatever the number of reads: the pre-cap read captures every key
+    at once, and so does the post-cap read. Six vectors across five layers therefore cost what one
+    costs, which is what makes a multi-vector panel affordable. Two keys at one layer are two
+    poolings of one captured tensor, not two forwards.
 
     Args:
-        model: The VLLMSteerModel instance
-        conversation: List of chat messages (user/assistant turns)
-        steer_type: The steer type this analysis corresponds to
-        layer: Layer to extract activations from
-        steering_spec: Optional SteeringSpec to apply during capture. If provided,
-            both pre-cap (base model) and post-cap (with steering) activations are captured.
+        model: the loaded model, on any backend
+        conversation: the full conversation, including the generated assistant turn
+        keys: the distinct captures the requested reads need
+        steering_specs: steering for the post-cap read, one spec per point written. None means
+            no post-cap read is wanted.
+        template_kwargs: what the endpoint rendered the generation prompt with. A re-capture
+            renders the conversation again, so anything the requested reads pinned about the
+            template has to be pinned the same way here or the two renderings diverge.
 
     Returns:
-        AssistantAxis response data, or None if persona data not available
+        ``(pre_cap, post_cap)``, each keyed by capture. ``post_cap`` is None when there is none.
     """
+    capture_start = time.time()
+    wanted = sorted(set(keys))
+    kwargs = template_kwargs or {}
+
+    pre_cap = await _capture_means(model, conversation, wanted, None, kwargs)
+    post_cap = await _capture_means(model, conversation, wanted, steering_specs, kwargs) if steering_specs else {}
+
     logger.debug(
-        f"[PERSONA] run_persona_monitor called for steer_type={steer_type}, layer={layer}, has_steering_spec={steering_spec is not None}"
+        f"[READ] captured {_describe_keys(pre_cap)} pre-cap / {_describe_keys(post_cap)} post-cap "
+        f"in {time.time() - capture_start:.3f}s"
     )
-    persona_start = time.time()
+    return pre_cap, post_cap or None
 
-    config = Config.get_instance()
-    model_id_for_data = config.override_model_id or config.model_id
 
-    # Get pre-loaded PCA data
-    logger.debug("[PERSONA] Getting PersonaData instance...")
-    persona_data = PersonaData.get_instance()
-    if not persona_data.is_initialized():
-        logger.warning("Persona data not initialized, skipping persona monitor")
-        return None
+def _describe_key(key: CaptureKey) -> str:
+    """One capture as ``resid_post:12/mean``, for a log line that says what was actually read."""
+    return f"{key.point}:{key.layer}/{key.pool}"
 
-    pca_results = persona_data.get_pca_data(layer)
-    if pca_results is None:
-        logger.warning(f"PCA data not available for layer {layer}")
-        return None
-    logger.debug(f"[PERSONA] PCA data loaded in {time.time() - persona_start:.3f}s")
 
-    # Wrap model with ProbingModelChatSpace
-    logger.debug("[PERSONA] Creating ProbingModelChatSpace wrapper...")
-    probing_model = ProbingModelChatSpace.from_existing(
-        model, tokenizer=None, model_name=model_id_for_data
-    )
+def _describe_keys(captures: dict[CaptureKey, torch.Tensor]) -> str:
+    return ", ".join(sorted(_describe_key(key) for key in captures)) or "nothing"
 
-    tokenizer = probing_model.tokenizer
-    encoder = ConversationEncoder(tokenizer, model_id_for_data)
-    mapper = SpanMapperChatSpace(tokenizer)
 
-    # Convert NPSteerChatMessage to the format expected by mapper
-    conversation_turns = [
-        {"role": msg.role, "content": msg.content} for msg in conversation
-    ]
+def _selected_indices(conversation: list[NPSteerChatMessage], tokens: TokenSelection) -> list[int]:
+    """Which of a conversation's messages get a reading.
 
-    # Extract mean activations per turn (pre-cap / base model)
-    logger.debug(
-        f"[PERSONA] Extracting pre-cap activations for {len(conversation_turns)} turns..."
-    )
-    extract_start = time.time()
-    mean_acts_per_turn = await mapper.mean_all_turn_activations_async(
-        probing_model, encoder, conversation_turns, layer=layer
-    )
-    logger.debug(
-        f"[PERSONA] Pre-cap activations extracted in {time.time() - extract_start:.3f}s, shape={mean_acts_per_turn.shape}"
-    )
+    Assistant turns are located by role rather than by position, so a conversation carrying a
+    system message (or one whose turns do not alternate) still lines its values up with its turns.
 
-    # Extract post-cap activations if steering_spec is provided
-    mean_acts_per_turn_post_cap = None
-    if steering_spec is not None:
-        logger.debug("[PERSONA] Extracting post-cap activations with steering_spec...")
-        extract_post_start = time.time()
-        mean_acts_per_turn_post_cap = await mapper.mean_all_turn_activations_async(
-            probing_model,
-            encoder,
-            conversation_turns,
-            layer=layer,
-            steering_spec=steering_spec,
-        )
-        logger.debug(
-            f"[PERSONA] Post-cap activations extracted in {time.time() - extract_post_start:.3f}s, shape={mean_acts_per_turn_post_cap.shape}"
-        )
+    Exhaustive over ``TokenSelection`` on purpose: a member added to that alias without a branch
+    here raises rather than falling back to the assistant turns, which would report a reading of
+    something other than what was asked for.
+    """
+    if tokens == "assistant_turns":
+        return [i for i, msg in enumerate(conversation) if msg.role == "assistant"]
+    if tokens == "all_turns":
+        return list(range(len(conversation)))
+    raise ValueError(f"token selection {tokens!r} is not implemented")
 
-    # Handle empty activations
-    if mean_acts_per_turn.shape[0] == 0:
-        logger.warning("No activations extracted, skipping persona monitor")
-        return None
 
-    # Compute projections (pre-cap)
-    role_projs = pc_projection(mean_acts_per_turn, pca_results, n_pcs=1)
+def build_readouts(
+    conversation: list[NPSteerChatMessage],
+    steer_type: NPSteerType,
+    reads: list[VectorAsset],
+    pre_cap: dict[CaptureKey, torch.Tensor],
+    post_cap: dict[CaptureKey, torch.Tensor] | None,
+) -> list[SteerVectorReadout]:
+    """Project the captured means onto each vector, one readout per vector.
 
-    # Compute projections (post-cap) if available
-    role_projs_post_cap = None
-    if (
-        mean_acts_per_turn_post_cap is not None
-        and mean_acts_per_turn_post_cap.shape[0] > 0
-    ):
-        role_projs_post_cap = pc_projection(
-            mean_acts_per_turn_post_cap, pca_results, n_pcs=1
-        )
+    Each vector reads the capture its own spec names and reports the messages its own selection
+    names, so two reads in one response may differ in both. A vector whose capture failed is dropped
+    rather than reported empty.
+    """
+    readouts: list[SteerVectorReadout] = []
+    for vector in reads:
+        pre_means = pre_cap.get(vector.capture_key)
+        if pre_means is None or pre_means.shape[0] == 0:
+            logger.warning(
+                f"[READ] no activations for {_describe_key(vector.capture_key)}, skipping vector '{vector.id}'"
+            )
+            continue
+        values, percentiles = project_vector_with_percentile(pre_means, vector)
 
-    # Find indices of assistant turns in the conversation (by actual role, not position assumption)
-    # This handles conversations with system messages where indices don't alternate user/assistant
-    assistant_indices = [
-        i for i, msg in enumerate(conversation) if msg.role == "assistant"
-    ]
+        post_means = (post_cap or {}).get(vector.capture_key)
+        values_post_cap: np.ndarray | None = None
+        percentiles_post_cap: np.ndarray | None = None
+        if post_means is not None and post_means.shape[0] > 0:
+            values_post_cap, percentiles_post_cap = project_vector_with_percentile(post_means, vector)
 
-    # Select projections for assistant turns only
-    assistant_role_projs = (
-        role_projs[assistant_indices] if assistant_indices else role_projs[0:0]
-    )
-    assistant_role_projs_post_cap = None
-    if role_projs_post_cap is not None:
-        assistant_role_projs_post_cap = (
-            role_projs_post_cap[assistant_indices]
-            if assistant_indices
-            else role_projs_post_cap[0:0]
-        )
+        selected = _selected_indices(conversation, vector.read.tokens)
+        snippets = [truncate_content(conversation[i].content) for i in selected]
 
-    # Get assistant turns for snippets
-    assistant_turns = [msg for msg in conversation if msg.role == "assistant"]
+        turns: list[SteerReadoutTurn] = []
+        for position, index in enumerate(selected):
+            if index >= len(values):
+                break
+            has_post = values_post_cap is not None and index < len(values_post_cap)
+            turns.append(
+                SteerReadoutTurn(
+                    value=float(values[index]),
+                    value_post_cap=float(values_post_cap[index]) if has_post else None,  # type: ignore[index]
+                    # None rather than 0 for a vector with no tables: absent says "this vector
+                    # cannot report a percentile", where 0 would say "dead centre".
+                    percentile=float(percentiles[index]) if percentiles is not None else None,
+                    percentile_post_cap=(
+                        float(percentiles_post_cap[index]) if has_post and percentiles_post_cap is not None else None
+                    ),
+                    snippet=snippets[position],
+                )
+            )
 
-    turns_data = []
-    for i in range(len(assistant_role_projs)):
-        pc_values = {
-            ROLE_PC_TITLES[j]: float(assistant_role_projs[i][j])
-            for j in range(len(ROLE_PC_TITLES))
-        }
-
-        # Add post-cap values if available
-        pc_values_post_cap = None
-        if assistant_role_projs_post_cap is not None and i < len(
-            assistant_role_projs_post_cap
-        ):
-            pc_values_post_cap = {
-                ROLE_PC_TITLES[j]: float(assistant_role_projs_post_cap[i][j])
-                for j in range(len(ROLE_PC_TITLES))
-            }
-
-        snippet = ""
-        if i < len(assistant_turns):
-            snippet = _truncate_content(assistant_turns[i].content)
-
-        turns_data.append(
-            SteerCompletionChatPost200ResponseAssistantAxisInnerTurnsInner(
-                pc_values=pc_values,
-                pc_values_post_cap=pc_values_post_cap,
-                snippet=snippet,
+        readouts.append(
+            SteerVectorReadout(
+                id=vector.id,
+                author=vector.author,
+                title=vector.title,
+                type=steer_type,
+                layer=vector.layer,
+                caveat=vector.caveat,
+                pole_positive=vector.pole_positive,
+                pole_negative=vector.pole_negative,
+                pole_positive_description=vector.pole_positive_description,
+                pole_negative_description=vector.pole_negative_description,
+                source_revision=vector.source_revision,
+                turns=turns,
             )
         )
-
-    logger.debug(
-        f"[PERSONA] Complete in {time.time() - persona_start:.3f}s, {len(turns_data)} assistant turns"
-    )
-    return SteerCompletionChatPost200ResponseAssistantAxisInner(
-        type=steer_type, pc_titles=list(ROLE_PC_TITLES), turns=turns_data
-    )
+    return readouts
 
 
 async def run_batched_generate(
     promptTokenized: torch.Tensor,
     inputPrompt: list[NPSteerChatMessage],
-    features: list[NPSteerFeature] | list[NPSteerVector],
+    settings: SteeringSettings,
     steer_types: list[NPSteerType],
-    strength_multiplier: float,
     seed: int | None = None,
-    steer_method: NPSteerMethod = NPSteerMethod.SIMPLE_ADDITIVE,
-    normalize_steering: bool = False,
     steer_special_tokens: bool = False,
     use_stream_lock: bool = False,
-    custom_hf_model_id: str | None = None,
-    n_logprobs: int = 0,
-    is_assistant_axis: bool = False,
+    reads: list[VectorAsset] | None = None,
     **kwargs: Any,
 ):
     async with await stream_lock(use_stream_lock):
         model = Model.get_instance()
-        sae_manager = SAEManager.get_instance()
 
-        # Add device logging
-        # logger.info(f"Model device: {model.cfg.device}")
-        # logger.info(f"Input tensor device: {promptTokenized.device}")
+        # steer_special_tokens=False -> exclude the model's special tokens (BOS/EOS + chat
+        # markers) from steering; the engine resolves the exact positions per model family
+        # (see SteerMask.SPECIAL_TOKENS). A backend that cannot carry a mask refuses it.
+        steer_position_mask = None if steer_special_tokens else SteerMask.SPECIAL_TOKENS
 
-        if seed is not None:
-            torch.manual_seed(seed)
+        async for msg in _run_chat_generate(
+            model=model,
+            promptTokenized=promptTokenized,
+            inputPrompt=inputPrompt,
+            settings=settings,
+            steer_types=steer_types,
+            seed=seed,
+            sampling=kwargs["sampling"],
+            max_new_tokens=int(kwargs.get("max_new_tokens") or 0),
+            reads=reads or [],
+            position_mask=steer_position_mask,
+        ):
+            yield msg
 
-        def steering_hook(activations: torch.Tensor, hook: Any) -> torch.Tensor:  # noqa: ARG001
-            # log activation device
-            # logger.info(f"Activations device: {activations.device}")
 
-            for i, flag in enumerate(steer_types):
-                if flag == NPSteerType.STEERED:
-                    if model.tokenizer is None:
-                        raise ValueError("Tokenizer is not initialized")
+def _chat_stream_frame(
+    steer_types: list[NPSteerType],
+    output_by_type: dict[NPSteerType, str],
+    prompt_string: str,
+    model: InterpModel,
+    promptTokenized: torch.Tensor,
+    inputPrompt: list[NPSteerChatMessage],
+) -> str:
+    """Build one streaming SSE frame from the running per-type outputs.
 
-                    # If we want to steer special tokens, then just pass it through without masking
-                    if steer_special_tokens:
-                        mask = torch.ones(
-                            activations.shape[1], device=activations.device
-                        )
-                    else:
-                        # TODO: Need to generalize beyond the gemma tokenizer
+    A type that hasn't started yet reads as empty. ``make_steer_completion_chat_response``
+    only emits the entries named in ``steer_types``.
+    """
+    return format_sse_message(
+        make_steer_completion_chat_response(
+            steer_types,
+            output_by_type.get(NPSteerType.STEERED, ""),
+            output_by_type.get(NPSteerType.DEFAULT, ""),
+            prompt_string,
+            model,
+            promptTokenized,
+            inputPrompt,
+        ).to_wire_json()
+    )
 
-                        # Get the current tokens for this batch
-                        current_tokens = promptTokenized.to(activations.device)
 
-                        mask = torch.ones(
-                            activations.shape[1], device=activations.device
-                        )
+async def _chat_readout_frame(
+    *,
+    model: InterpModel,
+    inputPrompt: list[NPSteerChatMessage],
+    output_by_type: dict[NPSteerType, str],
+    steer_types: list[NPSteerType],
+    prompt_string: str,
+    promptTokenized: torch.Tensor,
+    reads: list[VectorAsset],
+    steered_specs: list[SteeringSpec] | None,
+) -> str:
+    """Project every requested vector for every generated type, and build the final frame.
 
-                        # Find indices of special tokens
-
-                        bos_indices = (
-                            current_tokens == model.tokenizer.bos_token_id
-                        ).nonzero(as_tuple=True)[0]  # type: ignore
-                        start_of_turn_indices = (
-                            current_tokens
-                            == model.tokenizer.encode("<start_of_turn>")[0]
-                        ).nonzero(as_tuple=True)[0]
-                        end_of_turn_indices = (
-                            current_tokens == model.tokenizer.encode("<end_of_turn>")[0]
-                        ).nonzero(as_tuple=True)[0]
-
-                        # Apply masking rules
-                        # 1. Don't steer <bos>
-                        mask[bos_indices] = 0
-
-                        # 2. Don't steer <start_of_turn> and the next two tokens
-                        for idx in start_of_turn_indices:
-                            mask[idx : idx + 3] = 0
-
-                        # 3. Don't steer <end_of_turn> and the next token
-                        for idx in end_of_turn_indices:
-                            mask[idx : idx + 2] = 0
-                    # Apply steering with the mask
-                    for feature in features:
-                        steering_vector = torch.tensor(feature.steering_vector).to(
-                            activations.device
-                        )
-
-                        if not torch.isfinite(steering_vector).all():
-                            raise ValueError(
-                                "Steering vector contains inf or nan values"
-                            )
-
-                        if normalize_steering:
-                            norm = torch.norm(steering_vector)
-                            if norm == 0:
-                                raise ValueError("Zero norm steering vector")
-                            steering_vector = steering_vector / norm
-
-                        # If it's attention hook, reshape it to (n_heads, head_dim)
-                        if isinstance(
-                            feature, NPSteerFeature
-                        ) and "attn.hook_z" in sae_manager.get_sae_hook(feature.source):
-                            n_heads = model.cfg.n_heads
-                            d_head = model.cfg.d_head
-                            steering_vector = steering_vector.view(n_heads, d_head)
-
-                        coeff = strength_multiplier * feature.strength
-
-                        if steer_method == NPSteerMethod.SIMPLE_ADDITIVE:
-                            activations[i] += (
-                                coeff * steering_vector * mask.unsqueeze(-1)
-                            )
-
-                        elif steer_method == NPSteerMethod.ORTHOGONAL_DECOMP:
-                            projector = OrthogonalProjector(steering_vector)
-                            projected = projector.project(activations[i], coeff)
-                            activations[i] = activations[i] * (
-                                1 - mask.unsqueeze(-1)
-                            ) + projected * mask.unsqueeze(-1)
-
-            return activations
-
-        # Check if we need to generate both STEERED and DEFAULT
-        generate_both = (
-            NPSteerType.STEERED in steer_types and NPSteerType.DEFAULT in steer_types
+    ``steered_specs`` is passed only for the STEERED type, so post-cap activations are captured
+    under the same steering the text was generated under.
+    """
+    keys = sorted({vector.capture_key for vector in reads})
+    # Validated to agree back in the endpoint, so any vector's conditions are all of theirs.
+    render, _conflict = _agreed_render_conditions(reads)
+    readouts: list[SteerVectorReadout] = []
+    for steer_type, output_text in output_by_type.items():
+        full_conversation = list(inputPrompt) + [NPSteerChatMessage(role="assistant", content=output_text)]
+        is_steered = steer_type == NPSteerType.STEERED
+        pre_cap, post_cap = await capture_read_means(
+            model,
+            full_conversation,
+            keys,
+            steering_specs=steered_specs if is_steered else None,
+            template_kwargs=render.template_kwargs,
         )
-
-        if generate_both:
-            steered_partial_result = ""
-            default_partial_result = ""
-            steered_logprobs = None
-            default_logprobs = None
-
-            steered_partial_result_array: list[str] = []
-            default_partial_result_array: list[str] = []
-            steered_logprobs = None
-            default_logprobs = None
-
-            # Store the steering spec for persona monitor (VLLMSteerModel only)
-            vllm_steering_spec: SteeringSpec | None = None
-
-            # Generate STEERED and DEFAULT separately
-            for flag in [NPSteerType.STEERED, NPSteerType.DEFAULT]:
-                if seed is not None:
-                    torch.manual_seed(seed)  # Reset seed for each generation
-
-                if isinstance(model, HookedTransformer):
-                    model.reset_hooks()
-                    if flag == NPSteerType.STEERED:
-                        logger.info("Running Steered")
-                        editing_hooks = [
-                            (
-                                (
-                                    sae_manager.get_sae_hook(feature.source)
-                                    if isinstance(feature, NPSteerFeature)
-                                    else feature.hook
-                                ),
-                                steering_hook,
-                            )
-                            for feature in features
-                        ]
-                    else:
-                        logger.info("Running Default")
-                        editing_hooks = []
-
-                    logprobs = []
-
-                    with model.hooks(fwd_hooks=editing_hooks):  # type: ignore
-                        for i, (result, logits) in enumerate(
-                            model.generate_stream(
-                                max_tokens_per_yield=TOKENS_PER_YIELD,
-                                stop_at_eos=(model.cfg.device != "mps"),
-                                input=promptTokenized.unsqueeze(0),
-                                do_sample=True,
-                                return_logits=True,
-                                **kwargs,
-                            )
-                        ):
-                            to_append = ""
-                            if i == 0:
-                                to_append = model.to_string(result[0][1:])  # type: ignore
-                            else:
-                                to_append = model.to_string(result[0])  # type: ignore
-
-                            if n_logprobs > 0:
-                                current_logprobs = make_logprob_from_logits(
-                                    result,  # type: ignore
-                                    logits,  # type: ignore
-                                    model,
-                                    n_logprobs,
-                                )
-                                logprobs.append(current_logprobs)
-
-                            if flag == NPSteerType.STEERED:
-                                steered_partial_result += to_append  # type: ignore
-                                steered_logprobs = logprobs.copy() or None
-                            else:
-                                default_partial_result += to_append  # type: ignore
-                                default_logprobs = logprobs.copy() or None
-
-                            to_return = make_steer_completion_chat_response(
-                                steer_types,
-                                steered_partial_result,
-                                default_partial_result,
-                                model,
-                                promptTokenized,
-                                inputPrompt,
-                                custom_hf_model_id,
-                                steered_logprobs,
-                                default_logprobs,
-                            )  # type: ignore
-                            yield format_sse_message(to_return.to_json())
-
-                elif isinstance(model, StandardizedTransformer):
-                    logger.info("nnsight")
-                    if kwargs.get("freq_penalty"):
-                        logger.warning(
-                            "freq_penalty is not supported for StandardizedTransformer models, it will be ignored"
-                        )
-
-                    # Convert promptTokenized to string for nnsight
-                    prompt_string = model.tokenizer.decode(promptTokenized)
-
-                    # for nnsight we don't yield one token at a time (it hangs for some reason)
-                    # so we just send one message at the end
-                    nnsight_temp = kwargs.get("temperature", 1.0)
-                    nnsight_do_sample = nnsight_temp > 0
-                    with model.generate(
-                        prompt_string,
-                        temperature=nnsight_temp if nnsight_do_sample else None,
-                        max_new_tokens=kwargs.get("max_new_tokens"),
-                        do_sample=nnsight_do_sample,
-                    ) as tracer:
-                        with tracer.all():
-                            token = model.generator.streamer.output
-                            token_str = model.tokenizer.decode(token[-1])
-
-                            to_append = token_str  # type: ignore
-
-                            if flag == NPSteerType.STEERED:
-                                steered_partial_result_array.append(to_append)  # type: ignore
-                                # Sort features by layer number for nnsight (must be accessed in order)
-                                sorted_features = sorted(
-                                    features,
-                                    key=lambda f: _get_feature_layer_for_nnsight(
-                                        f, sae_manager
-                                    ),
-                                )
-                                for feature in sorted_features:
-                                    # get layer number
-                                    hook_name = (
-                                        sae_manager.get_sae_hook(feature.source)
-                                        if isinstance(feature, NPSteerFeature)
-                                        else feature.hook
-                                    )
-                                    if "resid_post" in hook_name:
-                                        layer = int(
-                                            hook_name.split(".")[1]
-                                        )  # blocks.0.hook_resid_post -> 0
-                                    elif "resid_pre" in hook_name:
-                                        layer = (
-                                            int(hook_name.split(".")[1]) - 1
-                                        )  # blocks.1.hook_resid_pre -> 0
-                                    else:
-                                        raise ValueError(
-                                            f"Unsupported hook name for nnsight: {hook_name}"
-                                        )
-
-                                    # only supporting resid_pre and post in nnsight for now
-                                    steering_vector = torch.tensor(
-                                        feature.steering_vector
-                                    ).to(model.device)
-
-                                    if not torch.isfinite(steering_vector).all():
-                                        raise ValueError(
-                                            "Steering vector contains inf or nan values"
-                                        )
-
-                                    if normalize_steering:
-                                        norm = torch.norm(steering_vector)
-                                        if norm == 0:
-                                            raise ValueError(
-                                                "Zero norm steering vector"
-                                            )
-                                        steering_vector = steering_vector / norm
-
-                                    coeff = strength_multiplier * feature.strength
-
-                                    if steer_method == NPSteerMethod.SIMPLE_ADDITIVE:
-                                        model.layers_output[layer - 1] += (
-                                            coeff
-                                            * steering_vector.to(
-                                                model.layers_output[layer - 1].device
-                                            )
-                                        )
-                                    elif (
-                                        steer_method == NPSteerMethod.ORTHOGONAL_DECOMP
-                                    ):
-                                        projector = OrthogonalProjector(
-                                            steering_vector.to(
-                                                model.layers_output[layer - 1].device
-                                            )
-                                        )
-                                        model.layers_output[layer - 1] = (
-                                            projector.project(
-                                                model.layers_output[layer - 1], coeff
-                                            )
-                                        )
-                            else:
-                                default_partial_result_array.append(to_append)  # type: ignore
-
-                elif VLLM_AVAILABLE and isinstance(model, VLLMSteerModel):
-                    if kwargs.get("freq_penalty"):
-                        logger.warning(
-                            "freq_penalty is not supported for VLLMSteerModel models, it will be ignored"
-                        )
-
-                    # Convert promptTokenized to string for nnsight
-                    prompt_string = model.tokenizer.decode(promptTokenized)
-
-                    sampling_params = SamplingParams(
-                        temperature=kwargs.get("temperature"),
-                        max_tokens=kwargs.get("max_new_tokens"),
-                        seed=seed,
-                    )
-
-                    if flag == NPSteerType.STEERED:
-                        # Build steering spec from all features
-                        steering_spec_layers = {}
-
-                        # Group features by layer
-                        layer_features: dict[
-                            int,
-                            list[tuple[NPSteerFeature | NPSteerVector, torch.Tensor]],
-                        ] = {}
-
-                        for feature in features:
-                            hook_name = (
-                                sae_manager.get_sae_hook(feature.source)
-                                if isinstance(feature, NPSteerFeature)
-                                else feature.hook
-                            )
-                            if "resid_post" in hook_name:
-                                layer = int(
-                                    hook_name.split(".")[1]
-                                )  # blocks.0.hook_resid_post -> 0
-                            elif "resid_pre" in hook_name:
-                                layer = (
-                                    int(hook_name.split(".")[1]) - 1
-                                )  # blocks.1.hook_resid_pre -> 0
-                            else:
-                                raise ValueError(
-                                    f"Unsupported hook name for chatspace: {hook_name}"
-                                )
-
-                            steering_vector = torch.tensor(feature.steering_vector)
-
-                            if not torch.isfinite(steering_vector).all():
-                                raise ValueError(
-                                    "Steering vector contains inf or nan values"
-                                )
-
-                            if normalize_steering:
-                                norm = torch.norm(steering_vector)
-                                if norm == 0:
-                                    raise ValueError("Zero norm steering vector")
-                                steering_vector = steering_vector / norm
-
-                            if layer not in layer_features:
-                                layer_features[layer] = []
-                            layer_features[layer].append((feature, steering_vector))
-
-                        # Build LayerSteeringSpec for each layer
-                        for layer, layer_feature_list in layer_features.items():
-                            operations: list[SteeringOp] = []
-
-                            if steer_method == NPSteerMethod.SIMPLE_ADDITIVE:
-                                # Add each feature as a separate AddSpec operation
-                                for feature, steering_vector in layer_feature_list:
-                                    coeff = strength_multiplier * feature.strength
-                                    norm = torch.norm(steering_vector)
-                                    if norm > 0:
-                                        normalized_vector = steering_vector / norm
-                                        operations.append(
-                                            AddSpec(
-                                                vector=normalized_vector,
-                                                scale=norm.item() * coeff,
-                                            )
-                                        )
-
-                            elif steer_method == NPSteerMethod.ORTHOGONAL_DECOMP:
-                                raise ValueError(
-                                    "Orthogonal decomposition is not supported for chatspace."
-                                )
-
-                            elif steer_method == NPSteerMethod.PROJECTION_CAP:
-                                # logger.info("projection cap")
-                                # Add each feature as a separate ProjectionCapSpec operation
-                                for feature, steering_vector in layer_feature_list:
-                                    coeff = strength_multiplier * feature.strength
-                                    operations.append(
-                                        ProjectionCapSpec(
-                                            vector=steering_vector, min=None, max=coeff
-                                        )
-                                    )
-
-                            if operations:
-                                steering_spec_layers[layer] = LayerSteeringSpec(
-                                    operations=operations
-                                )
-
-                        # Validate that we have at least one layer to steer
-                        if not steering_spec_layers:
-                            raise ValueError(
-                                "No valid steering layers found. All features may have zero-norm vectors or invalid configurations."
-                            )
-
-                        # Create and save steering spec for both generation and persona monitor
-                        vllm_steering_spec = SteeringSpec(layers=steering_spec_layers)
-
-                        # Use streaming generation
-                        stream_generator = await model.generate(
-                            prompt_string,
-                            sampling_params,
-                            steering_spec=vllm_steering_spec,
-                            stream=True,
-                        )
-                        output_total = ""
-                        async for delta in stream_generator:
-                            output_total += delta
-                            to_return = make_steer_completion_chat_response(
-                                steer_types,
-                                prompt_string + output_total,
-                                prompt_string + "".join(default_partial_result_array),
-                                model,
-                                promptTokenized,
-                                inputPrompt,
-                                custom_hf_model_id,
-                                steered_logprobs,
-                                default_logprobs,
-                            )  # type: ignore
-                            yield format_sse_message(to_return.to_json())
-                        # Update array after streaming completes
-                        steered_partial_result_array = [output_total]  # type: ignore
-                    else:
-                        # Use streaming generation for DEFAULT
-                        stream_generator = await model.generate(
-                            prompt_string, sampling_params, stream=True
-                        )
-                        output_total = ""
-                        async for delta in stream_generator:
-                            output_total += delta
-                            to_return = make_steer_completion_chat_response(
-                                steer_types,
-                                prompt_string + "".join(steered_partial_result_array),
-                                prompt_string + output_total,
-                                model,
-                                promptTokenized,
-                                inputPrompt,
-                                custom_hf_model_id,
-                                steered_logprobs,
-                                default_logprobs,
-                            )  # type: ignore
-                            yield format_sse_message(to_return.to_json())
-                        # Update array after streaming completes
-                        default_partial_result_array = [output_total]  # type: ignore
-
-            # After both STEERED and DEFAULT streaming completes for VLLMSteerModel,
-            # run persona monitor if is_assistant_axis
-            if (
-                VLLM_AVAILABLE
-                and isinstance(model, VLLMSteerModel)
-                and is_assistant_axis
-            ):
-                steered_output = "".join(steered_partial_result_array)
-                default_output = "".join(default_partial_result_array)
-
-                # Run persona monitor for each steer type
-                assistant_axis_data_list: list[
-                    SteerCompletionChatPost200ResponseAssistantAxisInner
-                ] = []
-
-                for steer_type_for_monitor in steer_types:
-                    if steer_type_for_monitor == NPSteerType.STEERED:
-                        output_for_monitor = steered_output
-                    else:
-                        output_for_monitor = default_output
-
-                    # Build full conversation including the generated assistant response
-                    full_conversation = list(inputPrompt) + [
-                        NPSteerChatMessage(role="assistant", content=output_for_monitor)
-                    ]
-
-                    # Pass steering_spec for STEERED type to get post-cap values
-                    steering_spec_for_monitor = (
-                        vllm_steering_spec
-                        if steer_type_for_monitor == NPSteerType.STEERED
-                        else None
-                    )
-
-                    axis_data = await run_persona_monitor(
-                        model,
-                        full_conversation,
-                        steer_type_for_monitor,
-                        DEFAULT_LAYER,
-                        steering_spec=steering_spec_for_monitor,
-                    )
-                    if axis_data is not None:
-                        assistant_axis_data_list.append(axis_data)
-
-                # Yield final message with persona monitor results
-                to_return = make_steer_completion_chat_response(
-                    steer_types,
-                    prompt_string + steered_output,
-                    prompt_string + default_output,
-                    model,
-                    promptTokenized,
-                    inputPrompt,
-                    custom_hf_model_id,
-                    steered_logprobs,
-                    default_logprobs,
-                    assistant_axis_data_list if assistant_axis_data_list else None,
-                )  # type: ignore
-                yield format_sse_message(to_return.to_json())
-
-            # for nnsight we don't yield one token at a time (it hangs for some reason)
-            # so we just send one message at the end
-            if isinstance(model, StandardizedTransformer):
-                to_return = make_steer_completion_chat_response(
-                    steer_types,
-                    "".join(steered_partial_result_array),
-                    "".join(default_partial_result_array),
-                    model,
-                    promptTokenized,
-                    inputPrompt,
-                    custom_hf_model_id,
-                    steered_logprobs,
-                    default_logprobs,
-                )  # type: ignore
-                yield format_sse_message(to_return.to_json())
-        else:
-            steer_type = steer_types[0]
-            if seed is not None:
-                torch.manual_seed(seed)
-
-            partial_result_array: list[str] = []
-
-            if isinstance(model, HookedTransformer):
-                model.reset_hooks()
-                editing_hooks = [
-                    (
-                        (
-                            sae_manager.get_sae_hook(feature.source)
-                            if isinstance(feature, NPSteerFeature)
-                            else feature.hook
-                        ),
-                        steering_hook,
-                    )
-                    for feature in features
-                ]
-                logger.info("steer_type: %s", steer_type)
-
-                with model.hooks(fwd_hooks=editing_hooks):  # type: ignore
-                    partial_result = ""
-                    logprobs = []
-
-                    for i, (result, logits) in enumerate(
-                        model.generate_stream(
-                            max_tokens_per_yield=TOKENS_PER_YIELD,
-                            stop_at_eos=(model.cfg.device != "mps"),
-                            input=promptTokenized.unsqueeze(0),
-                            do_sample=True,
-                            return_logits=True,
-                            **kwargs,
-                        )
-                    ):
-                        if i == 0:
-                            partial_result = model.to_string(result[0][1:])  # type: ignore
-                        else:
-                            partial_result += model.to_string(result[0])  # type: ignore
-
-                        if n_logprobs > 0:
-                            current_logprobs = make_logprob_from_logits(
-                                result,  # type: ignore
-                                logits,  # type: ignore
-                                model,
-                                n_logprobs,
-                            )
-                            logprobs.append(current_logprobs)
-
-                        to_return = make_steer_completion_chat_response(
-                            [steer_type],
-                            partial_result,  # type: ignore
-                            partial_result,  # type: ignore
-                            model,
-                            promptTokenized,
-                            inputPrompt,
-                            custom_hf_model_id,
-                            logprobs or None,
-                            logprobs or None,
-                        )
-                        yield format_sse_message(to_return.to_json())
-
-            elif isinstance(model, StandardizedTransformer):
-                logger.info("nnsight")
-                if kwargs.get("freq_penalty"):
-                    logger.warning(
-                        "freq_penalty is not supported for StandardizedTransformer models, it will be ignored"
-                    )
-
-                # Convert promptTokenized to string for nnsight
-                prompt_string = model.tokenizer.decode(promptTokenized)
-
-                nnsight_temp = kwargs.get("temperature", 1.0)
-                nnsight_do_sample = nnsight_temp > 0
-                with model.generate(
-                    prompt_string,
-                    temperature=nnsight_temp if nnsight_do_sample else None,
-                    max_new_tokens=kwargs.get("max_new_tokens"),
-                    do_sample=nnsight_do_sample,
-                ) as tracer:
-                    with tracer.all():
-                        token = model.generator.streamer.output
-                        partial_result_array.append(model.tokenizer.decode(token[-1]))  # type: ignore
-
-                        if steer_type == NPSteerType.STEERED:
-                            # Sort features by layer number for nnsight (must be accessed in order)
-                            sorted_features = sorted(
-                                features,
-                                key=lambda f: _get_feature_layer_for_nnsight(
-                                    f, sae_manager
-                                ),
-                            )
-                            for feature in sorted_features:
-                                # get layer number
-                                hook_name = (
-                                    sae_manager.get_sae_hook(feature.source)
-                                    if isinstance(feature, NPSteerFeature)
-                                    else feature.hook
-                                )
-                                if "resid_post" in hook_name:
-                                    layer = int(
-                                        hook_name.split(".")[1]
-                                    )  # blocks.0.hook_resid_post -> 0
-                                elif "resid_pre" in hook_name:
-                                    layer = (
-                                        int(hook_name.split(".")[1]) - 1
-                                    )  # blocks.1.hook_resid_pre -> 0
-                                else:
-                                    raise ValueError(
-                                        f"Unsupported hook name for nnsight: {hook_name}"
-                                    )
-
-                                # only supporting resid_pre and post in nnsight for now
-                                steering_vector = torch.tensor(
-                                    feature.steering_vector
-                                ).to(model.device)
-
-                                if not torch.isfinite(steering_vector).all():
-                                    raise ValueError(
-                                        "Steering vector contains inf or nan values"
-                                    )
-
-                                if normalize_steering:
-                                    norm = torch.norm(steering_vector)
-                                    if norm == 0:
-                                        raise ValueError("Zero norm steering vector")
-                                    steering_vector = steering_vector / norm
-
-                                coeff = strength_multiplier * feature.strength
-
-                                if steer_method == NPSteerMethod.SIMPLE_ADDITIVE:
-                                    model.layers_output[layer - 1] += (
-                                        coeff
-                                        * steering_vector.to(
-                                            model.layers_output[layer - 1].device
-                                        )
-                                    )
-                                elif steer_method == NPSteerMethod.ORTHOGONAL_DECOMP:
-                                    projector = OrthogonalProjector(
-                                        steering_vector.to(
-                                            model.layers_output[layer - 1].device
-                                        )
-                                    )
-                                    model.layers_output[layer - 1] = projector.project(
-                                        model.layers_output[layer - 1], coeff
-                                    )
-                        else:
-                            pass  # not steering
-                to_return = make_steer_completion_chat_response(
-                    [steer_type],
-                    "".join(partial_result_array),
-                    "".join(partial_result_array),
-                    model,
-                    promptTokenized,
-                    inputPrompt,
-                    custom_hf_model_id,
-                    None,
-                    None,
-                )  # type: ignore
-                yield format_sse_message(to_return.to_json())
-            elif VLLM_AVAILABLE and isinstance(model, VLLMSteerModel):
-                if kwargs.get("freq_penalty"):
-                    logger.warning(
-                        "freq_penalty is not supported for VLLMSteerModel models, it will be ignored"
-                    )
-
-                # Convert promptTokenized to string for chatspace
-                prompt_string = model.tokenizer.decode(promptTokenized)
-
-                sampling_params = SamplingParams(
-                    temperature=kwargs.get("temperature"),
-                    max_tokens=kwargs.get("max_new_tokens"),
-                    seed=seed,
-                )
-
-                # Store steering spec for persona monitor
-                single_type_steering_spec: SteeringSpec | None = None
-
-                if steer_type == NPSteerType.STEERED:
-                    # Build steering spec from all features
-                    steering_spec_layers = {}
-
-                    # Group features by layer
-                    layer_features: dict[
-                        int, list[tuple[NPSteerFeature | NPSteerVector, torch.Tensor]]
-                    ] = {}
-
-                    for feature in features:
-                        hook_name = (
-                            sae_manager.get_sae_hook(feature.source)
-                            if isinstance(feature, NPSteerFeature)
-                            else feature.hook
-                        )
-                        if "resid_post" in hook_name:
-                            layer = int(
-                                hook_name.split(".")[1]
-                            )  # blocks.0.hook_resid_post -> 0
-                        elif "resid_pre" in hook_name:
-                            layer = (
-                                int(hook_name.split(".")[1]) - 1
-                            )  # blocks.1.hook_resid_pre -> 0
-                        else:
-                            raise ValueError(
-                                f"Unsupported hook name for chatspace: {hook_name}"
-                            )
-
-                        steering_vector = torch.tensor(feature.steering_vector)
-
-                        if not torch.isfinite(steering_vector).all():
-                            raise ValueError(
-                                "Steering vector contains inf or nan values"
-                            )
-
-                        if normalize_steering:
-                            norm = torch.norm(steering_vector)
-                            if norm == 0:
-                                raise ValueError("Zero norm steering vector")
-                            steering_vector = steering_vector / norm
-
-                        if layer not in layer_features:
-                            layer_features[layer] = []
-                        layer_features[layer].append((feature, steering_vector))
-
-                    # Build LayerSteeringSpec for each layer
-                    for layer, layer_feature_list in layer_features.items():
-                        layer_operations: list[SteeringOp] = []
-
-                        if steer_method == NPSteerMethod.SIMPLE_ADDITIVE:
-                            # Add each feature as a separate AddSpec operation
-                            for feature, steering_vector in layer_feature_list:
-                                coeff = strength_multiplier * feature.strength
-                                norm = torch.norm(steering_vector)
-                                if norm > 0:
-                                    normalized_vector = steering_vector / norm
-                                    layer_operations.append(
-                                        AddSpec(
-                                            vector=normalized_vector,
-                                            scale=norm.item() * coeff,
-                                        )
-                                    )
-
-                        elif steer_method == NPSteerMethod.ORTHOGONAL_DECOMP:
-                            raise ValueError(
-                                "Orthogonal decomposition is not supported for chatspace."
-                            )
-
-                        elif steer_method == NPSteerMethod.PROJECTION_CAP:
-                            # logger.info("projection cap")
-                            # Add each feature as a separate ProjectionCapSpec operation
-                            for feature, steering_vector in layer_feature_list:
-                                coeff = strength_multiplier * feature.strength
-                                layer_operations.append(
-                                    ProjectionCapSpec(
-                                        vector=steering_vector, min=None, max=coeff
-                                    )
-                                )
-
-                        if layer_operations:
-                            steering_spec_layers[layer] = LayerSteeringSpec(
-                                operations=layer_operations
-                            )
-
-                    # Validate that we have at least one layer to steer
-                    if not steering_spec_layers:
-                        raise ValueError(
-                            "No valid steering layers found. All features may have zero-norm vectors or invalid configurations."
-                        )
-
-                    # Create and save steering spec for both generation and persona monitor
-                    single_type_steering_spec = SteeringSpec(
-                        layers=steering_spec_layers
-                    )
-
-                    # Use streaming generation
-                    stream_generator = await model.generate(
-                        prompt_string,
-                        sampling_params,
-                        steering_spec=single_type_steering_spec,
-                        stream=True,
-                    )
-                    output_total = ""
-                    async for delta in stream_generator:
-                        output_total += delta
-                        to_return = make_steer_completion_chat_response(
-                            [steer_type],
-                            prompt_string + output_total,
-                            prompt_string + output_total,
-                            model,
-                            promptTokenized,
-                            inputPrompt,
-                            custom_hf_model_id,
-                            None,
-                            None,
-                        )  # type: ignore
-                        yield format_sse_message(to_return.to_json())
-                else:
-                    # Use streaming generation for DEFAULT
-                    stream_generator = await model.generate(
-                        prompt_string, sampling_params, stream=True
-                    )
-                    output_total = ""
-                    async for delta in stream_generator:
-                        output_total += delta
-                        to_return = make_steer_completion_chat_response(
-                            [steer_type],
-                            prompt_string + output_total,
-                            prompt_string + output_total,
-                            model,
-                            promptTokenized,
-                            inputPrompt,
-                            custom_hf_model_id,
-                            None,
-                            None,
-                        )  # type: ignore
-                        yield format_sse_message(to_return.to_json())
-
-                # After streaming completes, run persona monitor if is_assistant_axis
-                if is_assistant_axis:
-                    # Build full conversation including the generated assistant response
-                    full_conversation = list(inputPrompt) + [
-                        NPSteerChatMessage(role="assistant", content=output_total)
-                    ]
-                    # Pass steering_spec for STEERED type to get post-cap values
-                    assistant_axis_data = await run_persona_monitor(
-                        model,
-                        full_conversation,
-                        steer_type,
-                        DEFAULT_LAYER,
-                        steering_spec=single_type_steering_spec
-                        if steer_type == NPSteerType.STEERED
-                        else None,
-                    )
-                    # Yield final message with persona monitor results
-                    to_return = make_steer_completion_chat_response(
-                        [steer_type],
-                        prompt_string + output_total,
-                        prompt_string + output_total,
-                        model,
-                        promptTokenized,
-                        inputPrompt,
-                        custom_hf_model_id,
-                        None,
-                        None,
-                        [assistant_axis_data] if assistant_axis_data else None,
-                    )  # type: ignore
-                    yield format_sse_message(to_return.to_json())
+        readouts.extend(build_readouts(full_conversation, steer_type, reads, pre_cap, post_cap))
+
+    to_return = make_steer_completion_chat_response(
+        steer_types,
+        output_by_type.get(NPSteerType.STEERED, ""),
+        output_by_type.get(NPSteerType.DEFAULT, output_by_type.get(NPSteerType.STEERED, "")),
+        prompt_string,
+        model,
+        promptTokenized,
+        inputPrompt,
+        readouts=readouts or None,
+    )
+    return format_sse_message(to_return.to_wire_json())
+
+
+async def _run_chat_generate(
+    *,
+    model: InterpModel,
+    promptTokenized: torch.Tensor,
+    inputPrompt: list[NPSteerChatMessage],
+    settings: SteeringSettings,
+    steer_types: list[NPSteerType],
+    seed: int | None,
+    sampling: SamplingSettings,
+    max_new_tokens: int,
+    reads: list[VectorAsset] | None = None,
+    position_mask: Any = None,
+):
+    """SSE generator over a chat-templated prompt, on whichever backend is loaded.
+
+    Mirrors `steer/completion.py`'s STEERED/DEFAULT flow but emits `SteerCompletionChatResponse`
+    frames. The prompt tokens come from the endpoint's `apply_chat_template` output
+    (`promptTokenized`) and go to the backend as ids, so one tokenization is in play. The
+    steering specs are built once (shared with ``/steer/completion``) and reused for STEERED
+    generation and for the post-cap vector read. ``position_mask`` excludes prompt positions
+    (e.g. special tokens) from steering.
+
+    When reads are requested, projects them on the generated conversation after streaming
+    (pre-cap always; post-cap under steering).
+    """
+    reads = reads or []
+    prompt_token_ids = [int(t) for t in promptTokenized.tolist()]
+    prompt_string = model.tokenizer.decode(promptTokenized)
+    # Only build the specs if a pass will actually use them. A DEFAULT-only request is
+    # legitimate -- the webapp collapses to it when the feature list is empty, and a
+    # readout-only request carries no features at all -- and building the specs eagerly turns
+    # that into a 500, since an empty feature list has no steering layers.
+    specs = features_to_steering_specs(settings) if NPSteerType.STEERED in steer_types else None
+
+    # Track each steer type's generated text so the readouts can analyze the
+    # full conversation (prompt + assistant turn) afterwards.
+    output_by_type: dict[NPSteerType, str] = {}
+    for flag in steer_types:
+        active_specs = specs if flag == NPSteerType.STEERED else None
+        text = ""
+        async for delta in _generate_text(
+            model,
+            prompt_token_ids,
+            active_specs,
+            max_new_tokens=max_new_tokens,
+            sampling=sampling,
+            seed=seed,
+            position_mask=position_mask,
+        ):
+            text += delta
+            output_by_type[flag] = text
+            yield _chat_stream_frame(
+                steer_types,
+                output_by_type,
+                prompt_string,
+                model,
+                promptTokenized,
+                inputPrompt,
+            )
+        output_by_type[flag] = text
+        if not text:
+            # No delta arrives when the model samples EOS first. One frame per type, even for an
+            # empty completion: a stream with no frame is a 500 downstream.
+            yield _chat_stream_frame(
+                steer_types,
+                output_by_type,
+                prompt_string,
+                model,
+                promptTokenized,
+                inputPrompt,
+            )
+
+    if reads:
+        yield await _chat_readout_frame(
+            model=model,
+            inputPrompt=inputPrompt,
+            output_by_type=output_by_type,
+            steer_types=steer_types,
+            prompt_string=prompt_string,
+            promptTokenized=promptTokenized,
+            reads=reads,
+            steered_specs=specs,
+        )
 
 
 def make_steer_completion_chat_response(
     steer_types: list[NPSteerType],
-    steered_result: str,
-    default_result: str,
-    model: HookedTransformer | StandardizedTransformer | VLLMSteerModel,
+    steered_output: str,
+    default_output: str,
+    prompt_string: str,
+    model: InterpModel,
     promptTokenized: torch.Tensor,
     promptChat: list[NPSteerChatMessage],
-    custom_hf_model_id: str | None = None,
     steered_logprobs: list[NPLogprob] | None = None,
     default_logprobs: list[NPLogprob] | None = None,
-    assistant_axis_data: list[SteerCompletionChatPost200ResponseAssistantAxisInner]
-    | None = None,
-) -> SteerCompletionChatPost200Response:
-    steerChatResults = []
-    for steer_type in steer_types:
-        if steer_type == NPSteerType.STEERED:
-            steerChatResults.append(
-                NPSteerChatResult(
-                    raw=steered_result,  # type: ignore
-                    chat_template=convert_to_chat_array(
-                        steered_result,
-                        model.tokenizer,
-                        custom_hf_model_id,  # type: ignore
-                    ),
-                    type=steer_type,
-                    logprobs=steered_logprobs,
-                )
-            )
-        else:
-            steerChatResults.append(
-                NPSteerChatResult(
-                    raw=default_result,  # type: ignore
-                    chat_template=convert_to_chat_array(
-                        default_result,
-                        model.tokenizer,
-                        custom_hf_model_id,  # type: ignore
-                    ),
-                    type=steer_type,
-                    logprobs=default_logprobs,
-                )
-            )
+    readouts: list[SteerVectorReadout] | None = None,
+) -> SteerCompletionChatResponse:
+    """Build the response from the prompt messages plus the text generated for each type.
 
-    # Handle token to string conversion for both model types
-    if isinstance(model, HookedTransformer):
-        prompt_raw = model.to_string(promptTokenized)  # type: ignore
-    elif isinstance(model, StandardizedTransformer) or (
-        VLLM_AVAILABLE and isinstance(model, VLLMSteerModel)
-    ):
-        prompt_raw = model.tokenizer.decode(promptTokenized)
-    else:
-        prompt_raw = ""
+    ``*_output`` is generation only (no prompt). The returned ``chat_template`` is composed:
+    the prompt messages we rendered from, plus the assistant turns implied by the generation.
+    Nothing re-parses the prompt scaffold, so this stays cheap to call per streaming frame.
+    """
+    output_by_type = {
+        NPSteerType.STEERED: steered_output,
+        NPSteerType.DEFAULT: default_output,
+    }
+    logprobs_by_type = {
+        NPSteerType.STEERED: steered_logprobs,
+        NPSteerType.DEFAULT: default_logprobs,
+    }
+    steerChatResults = [
+        NPSteerChatResult(
+            raw=prompt_string + output_by_type[steer_type],  # type: ignore
+            chat_template=list(promptChat)
+            + [
+                NPSteerChatMessage(role=turn.role, content=turn.content)
+                for turn in compose_assistant_turns(
+                    output_by_type[steer_type],
+                    model.tokenizer,
+                    prompt=prompt_string,
+                )
+            ],
+            type=steer_type,
+            logprobs=logprobs_by_type[steer_type],
+        )
+        for steer_type in steer_types
+    ]
 
-    return SteerCompletionChatPost200Response(
-        assistant_axis=assistant_axis_data,
+    prompt_raw = model.tokenizer.decode(promptTokenized) if model.tokenizer is not None else ""
+
+    return SteerCompletionChatResponse(
+        readouts=readouts,
         outputs=steerChatResults,
         input=NPSteerChatResult(
             raw=prompt_raw,  # type: ignore

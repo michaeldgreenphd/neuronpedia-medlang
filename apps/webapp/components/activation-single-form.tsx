@@ -2,19 +2,34 @@
 
 import ActivationItem from '@/components/activation-item';
 import { useGlobalContext } from '@/components/provider/global-provider';
-import { BOS_TOKENS } from '@/lib/utils/activations';
-import { getSourceSetNameFromSource } from '@/lib/utils/source';
+import { getSourceSetNameFromSource, isNeuronLayerSource } from '@/lib/utils/source';
 import { Activation } from '@prisma/client';
 import { MagnifyingGlassIcon } from '@radix-ui/react-icons';
 import copy from 'copy-to-clipboard';
 import { Check, Copy, Grid, Joystick, Play, Share, XIcon } from 'lucide-react';
 import { NeuronWithPartialRelations, SourceWithPartialRelations } from 'prisma/generated/zod';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import ReactTextareaAutosize from 'react-textarea-autosize';
 import { Button } from './shadcn/button';
 import { LoadingSquare } from './svg/loading-square';
 
 const DEFAULT_STEER_MULTIPLIER = 3;
+
+// The token to show beside a result: the most negative one when it is larger in size than the max.
+function peakOfResult(result: Activation) {
+  const min = result.values.reduce((m, v) => (v < m ? v : m), 0);
+  if (-min > result.maxValue) {
+    return { tokenIndex: result.values.indexOf(min), value: min, negative: true };
+  }
+  return { tokenIndex: result.maxValueTokenIndex, value: result.maxValue, negative: false };
+}
+
+function formatPeakValue(value: number) {
+  if (value.toFixed(2) === '0.00' || value.toFixed(2) === '-0.00') {
+    return value.toFixed(3) === '0.000' || value.toFixed(3) === '-0.000' ? value.toFixed(4) : value.toFixed(3);
+  }
+  return value.toFixed(2);
+}
 const HIDE_STEER_MODELS: string[] = []; // 'gpt-oss-20b'
 const HIDE_STEER_MODELS_PREFIX = ['gemma-3-'];
 
@@ -29,6 +44,7 @@ export default function ActivationSingleForm({
   embed = false,
   hideSteer = false,
   hideTestField = false, // this is a simple mode that only shows the result
+  overallMinValue,
 }: {
   neuron: NeuronWithPartialRelations;
   overallMaxValue: number;
@@ -40,6 +56,7 @@ export default function ActivationSingleForm({
   embed?: boolean;
   hideSteer?: boolean;
   hideTestField?: boolean;
+  overallMinValue?: number;
 }) {
   const {
     getSourceSet,
@@ -53,6 +70,7 @@ export default function ActivationSingleForm({
   const [customText, setCustomText] = useState('');
   const [activationResult, setActivationResult] = useState<Activation | undefined>();
   const [copyClicked, setCopyClicked] = useState(false);
+  const resultScrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (copyClicked) {
       setTimeout(() => {
@@ -75,6 +93,7 @@ export default function ActivationSingleForm({
       body: JSON.stringify({
         customText: text,
         neuron,
+        ignoreBos: hideBos,
       }),
     })
       .then(async (response) => {
@@ -90,21 +109,8 @@ export default function ActivationSingleForm({
       })
       .then((newActivation) => {
         if (newActivation !== null) {
+          // `ignoreBos` is applied server-side, so nothing to post-process here.
           const actToSet = newActivation;
-          if (hideBos) {
-            // TODO: do this in the inference instance instead
-            if (newActivation.tokens.length > 0 && BOS_TOKENS.includes(newActivation.tokens[0])) {
-              actToSet.tokens.shift();
-              actToSet.values.shift();
-              actToSet.maxValue = Math.max(...actToSet.values);
-              actToSet.maxValueTokenIndex = actToSet.values.indexOf(actToSet.maxValue);
-              if (newActivation.dfaValues !== undefined) {
-                actToSet.dfaValues.shift();
-                actToSet.dfaMaxValue = Math.max(...actToSet.dfaValues);
-                actToSet.dfaTargetIndex = actToSet.values.indexOf(actToSet.dfaMaxValue);
-              }
-            }
-          }
           setActivationResult(actToSet);
           const currentUrl = new URL(window.location.href);
           currentUrl.searchParams.set('defaulttesttext', actToSet.tokens.join(''));
@@ -141,6 +147,24 @@ export default function ActivationSingleForm({
     return `rgba(5, 150, 105, ${Math.max(opacity, min)})`;
   }
 
+  const resultPeak = activationResult ? peakOfResult(activationResult) : undefined;
+
+  // Scroll the result box (not the page) so that the peak token is in the middle.
+  useEffect(() => {
+    const container = resultScrollRef.current;
+    if (!container || !activationResult || isSubmitting) {
+      return;
+    }
+    const token = container.querySelector<HTMLElement>(
+      `[data-token-index="${peakOfResult(activationResult).tokenIndex}"]`,
+    );
+    if (!token) {
+      return;
+    }
+    const offset = token.getBoundingClientRect().top - container.getBoundingClientRect().top;
+    container.scrollTop += offset - container.clientHeight / 2 + token.offsetHeight / 2;
+  }, [activationResult, isSubmitting]);
+
   return (
     <div
       className={`flex w-full flex-row items-center justify-center gap-x-1.5 sm:border-0 ${
@@ -162,11 +186,17 @@ export default function ActivationSingleForm({
                   required
                   value={customText}
                   minRows={1}
+                  maxRows={5}
                   onChange={(e) => {
-                    if (enterSubmits && e.target.value.indexOf('\n') !== -1) {
-                      testClicked(e.target.value);
-                    } else {
-                      setCustomText(e.target.value);
+                    setCustomText(e.target.value);
+                  }}
+                  onKeyDown={(e) => {
+                    // Enter runs the test, Shift+Enter adds a line
+                    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                      e.preventDefault();
+                      if (!isSubmitting) {
+                        testClicked(customText);
+                      }
                     }
                   }}
                   className="form-input mt-0 block w-full flex-1 resize-none rounded-l border-0 border-slate-300 px-2.5 py-2 font-mono text-[11px] leading-tight text-slate-700 placeholder-slate-400 focus:border-slate-300 focus:outline-0 focus:ring-0 sm:h-24 sm:px-3 sm:text-xs"
@@ -227,41 +257,36 @@ export default function ActivationSingleForm({
             <div className="flex w-full flex-row pb-0.5 pt-1 sm:pb-1 sm:pt-2">
               <div className="hidden max-h-72 shrink-0 flex-col items-center justify-center overflow-y-scroll text-center sm:flex">
                 <div className="px-5 font-mono text-[10px] font-medium text-slate-500">
-                  {activationResult.maxValueTokenIndex !== undefined && activationResult.tokens !== undefined ? (
-                    <span>{activationResult.tokens[activationResult.maxValueTokenIndex]}</span>
+                  {activationResult.tokens !== undefined ? (
+                    <span>{activationResult.tokens[resultPeak?.tokenIndex ?? 0]}</span>
                   ) : (
                     ''
                   )}
                 </div>
                 <div
-                  className="px-5 font-mono text-[10px] font-bold"
-                  style={{
-                    color: makeActivationTextColor(1, 1, 0.5),
-                  }}
+                  className={`px-5 font-mono text-[10px] font-bold ${resultPeak?.negative ? 'text-rose-600' : ''}`}
+                  style={resultPeak?.negative ? undefined : { color: makeActivationTextColor(1, 1, 0.5) }}
                 >
-                  {activationResult.maxValue.toFixed(2) === '0.00'
-                    ? activationResult.maxValue.toFixed(3) === '0.000'
-                      ? activationResult.maxValue.toFixed(4)
-                      : activationResult.maxValue.toFixed(3)
-                    : activationResult.maxValue.toFixed(2)}
+                  {formatPeakValue(resultPeak?.value ?? 0)}
                 </div>
               </div>
-              <div className="max-h-72 flex-auto overflow-y-scroll px-3 text-sm sm:px-0">
+              <div ref={resultScrollRef} className="max-h-72 flex-auto overflow-y-scroll px-3 text-sm sm:px-0">
                 <ActivationItem
                   activation={activationResult}
                   overallMaxActivationValueInList={
                     overallMaxValue === -100 ? activationResult.maxValue : overallMaxValue
                   }
+                  overallMinActivationValueInList={overallMinValue}
                   overrideTextSize="text-[10px] sm:text-xs"
                   showLineBreaks
                   dfa={getSourceSet(neuron.modelId, neuron.sourceSetName || '')?.showDfa}
                 />
               </div>
               {!embed && (
-                <div className="mt-0 flex flex-row items-center justify-start">
+                <div className="ml-3 mt-0 flex shrink-0 flex-col items-center justify-start gap-y-1.5 py-1">
                   <button
                     type="button"
-                    className="my-1 ml-3 flex w-[62px] cursor-pointer flex-row items-center justify-center gap-x-0.5 whitespace-pre rounded bg-slate-200 px-1.5 py-1.5 text-[9px] font-medium text-slate-600 hover:bg-slate-300 sm:px-2 sm:py-1.5 sm:text-[10.5px]"
+                    className="flex w-[62px] cursor-pointer flex-row items-center justify-center gap-x-0.5 whitespace-pre rounded bg-slate-200 px-1.5 py-1.5 text-[9px] font-medium text-slate-600 hover:bg-slate-300 sm:px-2 sm:py-1.5 sm:text-[10.5px]"
                     title="Clear Result"
                     onClick={() => {
                       setActivationResult(undefined);
@@ -272,23 +297,26 @@ export default function ActivationSingleForm({
                   >
                     <XIcon className="h-3 w-3" /> Reset
                   </button>
+                  {/* TopK search ranks SAE latents; MLP neuron layers have none */}
+                  {!isNeuronLayerSource(neuron.layer) && (
+                    <button
+                      type="button"
+                      className="flex w-[62px] cursor-pointer flex-row items-center justify-center gap-x-0.5 whitespace-pre rounded bg-slate-200 px-1.5 py-1.5 text-[9px] font-medium text-slate-600 hover:bg-slate-300 sm:px-2 sm:py-1.5 sm:text-[10.5px]"
+                      title="TopK Search"
+                      onClick={() => {
+                        const textToUse = activationResult.tokens.join('');
+                        window.open(
+                          `/search-topk-by-token?modelId=${neuron.modelId}&source=${neuron.layer}&text=${encodeURIComponent(textToUse)}`,
+                          '_blank',
+                        );
+                      }}
+                    >
+                      <MagnifyingGlassIcon className="h-3 w-3" /> TopK
+                    </button>
+                  )}
                   <button
                     type="button"
-                    className="my-1 ml-1.5 flex w-[62px] cursor-pointer flex-row items-center justify-center gap-x-0.5 whitespace-pre rounded bg-slate-200 px-1.5 py-1.5 text-[9px] font-medium text-slate-600 hover:bg-slate-300 sm:px-2 sm:py-1.5 sm:text-[10.5px]"
-                    title="TopK Search"
-                    onClick={() => {
-                      const textToUse = activationResult.tokens.join('');
-                      window.open(
-                        `/search-topk-by-token?modelId=${neuron.modelId}&source=${neuron.layer}&text=${encodeURIComponent(textToUse)}`,
-                        '_blank',
-                      );
-                    }}
-                  >
-                    <MagnifyingGlassIcon className="h-3 w-3" /> TopK
-                  </button>
-                  <button
-                    type="button"
-                    className="my-1 ml-1.5 flex w-[62px] cursor-pointer flex-row items-center justify-center gap-x-0.5 whitespace-pre rounded bg-slate-200 px-1.5 py-1.5 text-[9px] font-medium text-slate-600 hover:bg-slate-300 sm:px-2 sm:py-1.5 sm:text-[10.5px]"
+                    className="flex w-[62px] cursor-pointer flex-row items-center justify-center gap-x-0.5 whitespace-pre rounded bg-slate-200 px-1.5 py-1.5 text-[9px] font-medium text-slate-600 hover:bg-slate-300 sm:px-2 sm:py-1.5 sm:text-[10.5px]"
                     title="Share Custom Activation Test Result"
                     onClick={() => {
                       const url = `${window.location.origin}/${neuron.modelId}/${neuron.layer}/${

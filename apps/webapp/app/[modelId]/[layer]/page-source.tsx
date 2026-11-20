@@ -10,7 +10,7 @@ import UmapPane from '@/components/panes/umap-pane';
 import { BreadcrumbItem, BreadcrumbLink } from '@/components/shadcn/breadcrumbs';
 import { getVisibilityBadge } from '@/components/visibility-badge';
 import { DEMO_MODE } from '@/lib/env';
-import { getLayerNumAsStringFromSource } from '@/lib/utils/source';
+import { getLayerNumAsStringFromSource, saeHasConfig } from '@/lib/utils/source';
 import {
   EvalWithPartialRelations,
   SourceReleaseWithRelations,
@@ -31,6 +31,8 @@ export default function PageSource({
   simMatrixDemo?: string;
 }) {
   const release = source.set && source.set.releases ? source.set.releases : null;
+  // Dashboards in files (R2) have no SAE evals.
+  const hasExternalDashboards = Boolean(source.set?.externalDashboardsUrl);
 
   return (
     <div className="flex w-full flex-col items-center pb-10">
@@ -123,11 +125,13 @@ export default function PageSource({
             />
           )}
 
-          <div className="flex w-full flex-col items-center justify-center">
-            <div className="w-full max-w-screen-lg">
-              <SaeLensConfigPane inSAEPage sae={source as SourceWithPartialRelations} />
+          {saeHasConfig(source as SourceWithPartialRelations) && (
+            <div className="flex w-full flex-col items-center justify-center">
+              <div className="w-full max-w-screen-lg">
+                <SaeLensConfigPane inSAEPage sae={source as SourceWithPartialRelations} />
+              </div>
             </div>
-          </div>
+          )}
 
           {source.inferenceEnabled && (
             <SearchInferenceSourcePane
@@ -144,19 +148,6 @@ export default function PageSource({
               </div>
             </div>
           )}
-
-          <div className="flex w-full items-center justify-center">
-            <div className="flex w-full max-w-screen-lg">
-              <SearchExplanationsPane
-                initialModelId={source.modelId}
-                initialSourceSetName={source.set?.name || ''}
-                initialSelectedLayers={[source.id]}
-                filterToRelease={release as SourceReleaseWithRelations}
-                defaultTab="bySource"
-                showTabs={false}
-              />
-            </div>
-          </div>
 
           {source.hasUmap && (
             <div className="w-full">
@@ -183,12 +174,25 @@ export default function PageSource({
             />
           )}
 
-          {!DEMO_MODE && (
+          {!DEMO_MODE && !hasExternalDashboards && (
             <SAEEvalsPane
               sae={source as SourceWithPartialRelations}
               evals={source.evals as EvalWithPartialRelations[]}
             />
           )}
+
+          <div className="flex w-full items-center justify-center">
+            <div className="flex w-full max-w-screen-lg">
+              <SearchExplanationsPane
+                initialModelId={source.modelId}
+                initialSourceSetName={source.set?.name || ''}
+                initialSelectedLayers={[source.id]}
+                filterToRelease={release as SourceReleaseWithRelations}
+                defaultTab="bySource"
+                showTabs={false}
+              />
+            </div>
+          </div>
         </div>
       </div>
     </div>

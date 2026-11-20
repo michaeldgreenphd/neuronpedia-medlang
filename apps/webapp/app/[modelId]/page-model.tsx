@@ -11,7 +11,12 @@ import { BreadcrumbLink, BreadcrumbPage } from '@/components/shadcn/breadcrumbs'
 import { getVisibilityBadge } from '@/components/visibility-badge';
 import { prisma } from '@/lib/db';
 import { SearchExplanationsType } from '@/lib/utils/general';
-import { getFirstSourceForModel, getFirstSourceSetForModel } from '@/lib/utils/source';
+import {
+  getDefaultSourceForModel,
+  getDefaultSourceSetForModel,
+  getFirstSourceForModel,
+  getFirstSourceSetForModel,
+} from '@/lib/utils/source';
 import { ModelWithPartialRelations } from '@/prisma/generated/zod';
 import { Visibility } from '@prisma/client';
 
@@ -46,6 +51,8 @@ export default async function PageModel({ model }: { model: ModelWithPartialRela
 
   const firstSourceSet = getFirstSourceSetForModel(model, Visibility.PUBLIC, false, false);
   const firstSource = getFirstSourceForModel(model, Visibility.PUBLIC, false, false);
+  const jumpToSourceSet = getDefaultSourceSetForModel(model, true);
+  const jumpToSource = getDefaultSourceForModel(model, true);
   return (
     <div className="flex w-full flex-col items-center pb-10">
       <BreadcrumbsComponent
@@ -71,8 +78,8 @@ export default async function PageModel({ model }: { model: ModelWithPartialRela
           <div className="flex flex-row justify-end gap-x-3">
             <JumpToPane
               defaultModelId={model.id}
-              defaultSourceSetName={firstSourceSet?.name || ''}
-              defaultSourceId={firstSource?.id || ''}
+              defaultSourceSetName={jumpToSourceSet?.name || ''}
+              defaultSourceId={jumpToSource?.id || ''}
               vertical
               filterToFeaturedReleases={false}
               showRandomFeature={false}
@@ -92,7 +99,11 @@ export default async function PageModel({ model }: { model: ModelWithPartialRela
       {modelHeadMetrics.length > 0 && (
         <div className="mt-6 w-full max-w-screen-lg">
           <div className="flex w-full flex-col items-center justify-center">
-            <ModelHeadMetricsPane modelId={model.id} metrics={modelHeadMetrics} />
+            <ModelHeadMetricsPane
+              modelId={model.id}
+              metrics={modelHeadMetrics}
+              inferenceEnabled={model.inferenceEnabled}
+            />
           </div>
         </div>
       )}
@@ -103,14 +114,6 @@ export default async function PageModel({ model }: { model: ModelWithPartialRela
         </div>
       )}
 
-      <div className="mt-6 flex w-full max-w-screen-lg flex-col items-start justify-center gap-x-3 gap-y-5 sm:flex-row">
-        <SearchExplanationsPane
-          initialModelId={model.id}
-          initialSourceSetName={model.sourceSets && model.sourceSets.length > 0 ? model.sourceSets[0].name : ''}
-          defaultTab={SearchExplanationsType.BY_MODEL}
-          showTabs
-        />
-      </div>
       {firstSourceSet?.allowInferenceSearch && (
         <div className="mt-6 w-full max-w-screen-lg">
           <SearchInferenceModelPane model={model} />
@@ -123,6 +126,15 @@ export default async function PageModel({ model }: { model: ModelWithPartialRela
           sourceSet={firstSourceSet?.name || ''}
           layer={firstSource?.id || ''}
           showModel
+        />
+      </div>
+
+      <div className="mt-6 flex w-full max-w-screen-lg flex-col items-start justify-center gap-x-3 gap-y-5 sm:flex-row">
+        <SearchExplanationsPane
+          initialModelId={model.id}
+          initialSourceSetName={model.sourceSets && model.sourceSets.length > 0 ? model.sourceSets[0].name : ''}
+          defaultTab={SearchExplanationsType.BY_MODEL}
+          showTabs
         />
       </div>
     </div>

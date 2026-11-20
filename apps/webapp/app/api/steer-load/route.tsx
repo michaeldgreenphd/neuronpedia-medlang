@@ -1,11 +1,11 @@
+import { NPSteerMethod } from '@/lib/api/inference-types';
 import { prisma } from '@/lib/db';
 import { NEXT_PUBLIC_URL } from '@/lib/env';
+import { axisReadoutsToLegacyAssistantAxis } from '@/lib/utils/steer-axis-legacy';
+import { axisReadoutsToPublic } from '@/lib/utils/steer-axis-public';
+import { axisReadoutsFromStored, storedOutputTextIncludesPrompt } from '@/lib/utils/steer-wire';
 import { RequestOptionalUser, withOptionalUser } from '@/lib/with-user';
 import { SteerOutputType } from '@prisma/client';
-import {
-  NPSteerMethod,
-  SteerCompletionChatPost200ResponseAssistantAxisInnerFromJSON,
-} from 'neuronpedia-inference-client';
 import { NextResponse } from 'next/server';
 import { object, string, ValidationError } from 'yup';
 import { SteerResultChat } from '../steer-chat/route';
@@ -26,6 +26,7 @@ export const POST = withOptionalUser(async (request: RequestOptionalUser) => {
       [SteerOutputType.STEERED]: null,
       [SteerOutputType.DEFAULT]: null,
       inputText: null,
+      outputTextIncludesPrompt: false,
       id: null,
       shareUrl: undefined,
       limit: '0',
@@ -67,7 +68,7 @@ export const POST = withOptionalUser(async (request: RequestOptionalUser) => {
           inputText: savedSteerSteeredOutput.inputText,
           temperature: savedSteerSteeredOutput.temperature,
           numTokens: savedSteerSteeredOutput.numTokens,
-          freqPenalty: savedSteerSteeredOutput.freqPenalty,
+          presencePenalty: savedSteerSteeredOutput.presencePenalty,
           seed: savedSteerSteeredOutput.seed,
           strengthMultiplier: savedSteerSteeredOutput.strengthMultiplier,
           version: savedSteerSteeredOutput.version,
@@ -91,9 +92,14 @@ export const POST = withOptionalUser(async (request: RequestOptionalUser) => {
 
     toReturnResult.inputText = savedSteerSteeredOutput.inputText;
 
+    // Unlike the generation routes, this looks a row up by id, so it has no version filter to keep
+    // old rows out -- an existing shared link still has to load.
+    toReturnResult.outputTextIncludesPrompt = storedOutputTextIncludesPrompt(savedSteerSteeredOutput);
+
     toReturnResult.settings = {
       temperature: savedSteerSteeredOutput.temperature,
       n_tokens: savedSteerSteeredOutput.numTokens,
+      presence_penalty: savedSteerSteeredOutput.presencePenalty,
       freq_penalty: savedSteerSteeredOutput.freqPenalty,
       seed: savedSteerSteeredOutput.seed,
       strength_multiplier: savedSteerSteeredOutput.strengthMultiplier,
@@ -104,28 +110,22 @@ export const POST = withOptionalUser(async (request: RequestOptionalUser) => {
     toReturnResult.id = savedSteerSteeredOutput.id;
     toReturnResult.shareUrl = `${NEXT_PUBLIC_URL}/steer/${savedSteerSteeredOutput.id}`;
 
-    // Handle assistant_axis (capMonitorOutput) for PROJECTION_CAP steer method
-    const isAssistantAxis = savedSteerSteeredOutput.steerMethod === NPSteerMethod.ProjectionCap;
-    if (isAssistantAxis) {
-      toReturnResult.assistant_axis = [];
-
-      // Get capMonitorOutput for steered output (use cached data only)
-      // Use FromJSON to transform snake_case (stored in DB) to camelCase (TypeScript client types)
-      const steeredCapMonitor = savedSteerSteeredOutput.capMonitorOutput;
-      if (steeredCapMonitor) {
-        const parsed = JSON.parse(steeredCapMonitor);
-        toReturnResult.assistant_axis.push(SteerCompletionChatPost200ResponseAssistantAxisInnerFromJSON(parsed));
-      }
-
-      // Get capMonitorOutput for default output (use cached data only)
-      const defaultCapMonitor = savedSteerDefaultOutput.capMonitorOutput;
-      if (defaultCapMonitor) {
-        const parsed = JSON.parse(defaultCapMonitor);
-        toReturnResult.assistant_axis.push(SteerCompletionChatPost200ResponseAssistantAxisInnerFromJSON(parsed));
-      }
-
-      if (toReturnResult.assistant_axis.length === 0) {
-        toReturnResult.assistant_axis = undefined;
+    // Axis readouts (capMonitorOutput) for the PROJECTION_CAP steer method. Cached data only:
+    // loading a shared link must not run inference.
+    if (savedSteerSteeredOutput.steerMethod === NPSteerMethod.PROJECTION_CAP) {
+      const readouts = [
+        ...axisReadoutsFromStored(
+          savedSteerSteeredOutput.capMonitorOutput ? JSON.parse(savedSteerSteeredOutput.capMonitorOutput) : null,
+          SteerOutputType.STEERED,
+        ),
+        ...axisReadoutsFromStored(
+          savedSteerDefaultOutput.capMonitorOutput ? JSON.parse(savedSteerDefaultOutput.capMonitorOutput) : null,
+          SteerOutputType.DEFAULT,
+        ),
+      ];
+      if (readouts.length > 0) {
+        toReturnResult.axes = axisReadoutsToPublic(readouts);
+        toReturnResult.assistant_axis = axisReadoutsToLegacyAssistantAxis(readouts);
       }
     }
 

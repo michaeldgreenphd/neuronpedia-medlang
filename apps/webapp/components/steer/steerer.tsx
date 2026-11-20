@@ -7,19 +7,20 @@ import ModelSelector from '@/components/feature-selector/model-selector';
 import NewVectorForm from '@/components/new-vector-form';
 import { useGlobalContext } from '@/components/provider/global-provider';
 import { Button } from '@/components/shadcn/button';
+import { NPLogprob, NPSteerMethod } from '@/lib/api/inference-types';
 import { useIsMount } from '@/lib/hooks/use-is-mount';
 import { SearchExplanationsType } from '@/lib/utils/general';
-import { getFirstSourceSetForModel } from '@/lib/utils/source';
+import { emptyNeuron } from '@/lib/utils/neuron-dashboards';
+import { getFirstSourceSetForModel, isSteerableNeuronLayer, NEURONS_SOURCESET } from '@/lib/utils/source';
 import {
   ChatMessage,
-  convertOldSteerOutputToChatMessages,
   FeaturePreset,
   replaceSteerModelIdIfNeeded,
-  STEER_FREQUENCY_PENALTY,
   STEER_METHOD,
   STEER_N_COMPLETION_TOKENS,
   STEER_N_COMPLETION_TOKENS_LARGE_LLM,
   STEER_N_COMPLETION_TOKENS_THINKING,
+  STEER_PRESENCE_PENALTY,
   STEER_SEED,
   STEER_SPECIAL_TOKENS,
   STEER_STRENGTH_MULTIPLIER,
@@ -30,7 +31,6 @@ import {
 import { NeuronWithPartialRelations } from '@/prisma/generated/zod';
 import { Model, Visibility } from '@prisma/client';
 import { ChevronDown, ChevronUp } from 'lucide-react';
-import { NPLogprob, NPSteerMethod } from 'neuronpedia-inference-client';
 import { useSearchParams } from 'next/navigation';
 import { useEffect, useState } from 'react';
 import SteerAdvancedSettings from './advanced-settings';
@@ -69,6 +69,8 @@ export default function Steerer({
     getInferenceEnabledForModel,
     getFirstInferenceEnabledModel,
     getInferenceEnabledModels,
+    getSource,
+    getSourceSet,
   } = useGlobalContext();
   const searchParams = useSearchParams();
   const hideModelSelector = searchParams.get('hideModelSelector') === 'true';
@@ -84,6 +86,8 @@ export default function Steerer({
   const [typedInText, setTypedInText] = useState('');
   const [defaultChatMessages, setDefaultChatMessages] = useState<ChatMessage[]>([]);
   const [steeredChatMessages, setSteeredChatMessages] = useState<ChatMessage[]>([]);
+  // the prompt that produced the current completions - shown before the outputs so they read as continuations
+  const [completionPrompt, setCompletionPrompt] = useState('');
   const [defaultCompletionText, setDefaultCompletionText] = useState('');
   const [defaultCompletionLogProbs, setDefaultCompletionLogProbs] = useState<NPLogprob[] | null>(null);
   const [steeredCompletionText, setSteeredCompletionText] = useState('');
@@ -96,7 +100,7 @@ export default function Steerer({
       : STEER_N_COMPLETION_TOKENS,
   );
   const [temperature, setTemperature] = useState(STEER_TEMPERATURE);
-  const [freqPenalty, setFreqPenalty] = useState(STEER_FREQUENCY_PENALTY);
+  const [presencePenalty, setPresencePenalty] = useState(STEER_PRESENCE_PENALTY);
   const [strMultiple, setStrMultiple] = useState(STEER_STRENGTH_MULTIPLIER);
   const [steerSpecialTokens, setSteerSpecialTokens] = useState(STEER_SPECIAL_TOKENS);
   const [seed, setSeed] = useState(STEER_SEED);
@@ -140,6 +144,7 @@ export default function Steerer({
   function reset() {
     setDefaultChatMessages([]);
     setSteeredChatMessages([]);
+    setCompletionPrompt('');
     setDefaultCompletionText('');
     setSteeredCompletionText('');
     setDefaultCompletionLogProbs(null);
@@ -218,6 +223,7 @@ export default function Steerer({
       .then((resp: SteerResultChat | null) => {
         if (resp === null) {
           setIsSteering(false);
+          setCompletionPrompt('');
           setDefaultCompletionText('');
           setSteeredCompletionText('');
           setDefaultCompletionLogProbs(null);
@@ -228,7 +234,7 @@ export default function Steerer({
         if (resp.settings) {
           setTemperature(resp.settings.temperature);
           setSteerTokens(resp.settings.n_tokens);
-          setFreqPenalty(resp.settings.freq_penalty);
+          setPresencePenalty(resp.settings.presence_penalty);
           setSeed(resp.settings.seed);
           setStrMultiple(resp.settings.strength_multiplier);
           setSteerSpecialTokens(resp.settings.steer_special_tokens);
@@ -242,22 +248,14 @@ export default function Steerer({
           setDefaultCompletionLogProbs(resp.DEFAULT?.logprobs || null);
           setSteeredCompletionLogProbs(resp.STEERED?.logprobs || null);
           setTypedInText(resp.inputText || '');
+          // Old saved completions already contain the prompt in their text, so prepending it here
+          // would show it twice.
+          setCompletionPrompt(resp.outputTextIncludesPrompt ? '' : resp.inputText || '');
         } else {
-          // if chat template is null, we need to convert it (it's an older form of steering)
-
-          if (resp.DEFAULT?.chatTemplate) {
-            setDefaultChatMessages(resp.DEFAULT?.chatTemplate || []);
-            setSteeredChatMessages(resp.STEERED?.chatTemplate || []);
-            setDefaultCompletionLogProbs(resp.DEFAULT?.logprobs || null);
-            setSteeredCompletionLogProbs(resp.STEERED?.logprobs || null);
-          } else {
-            const defaultRaw = resp.DEFAULT?.raw;
-            const steeredRaw = resp.STEERED?.raw;
-            if (defaultRaw && steeredRaw) {
-              setDefaultChatMessages(convertOldSteerOutputToChatMessages(defaultRaw));
-              setSteeredChatMessages(convertOldSteerOutputToChatMessages(steeredRaw));
-            }
-          }
+          setDefaultChatMessages(resp.DEFAULT?.chatTemplate || []);
+          setSteeredChatMessages(resp.STEERED?.chatTemplate || []);
+          setDefaultCompletionLogProbs(resp.DEFAULT?.logprobs || null);
+          setSteeredCompletionLogProbs(resp.STEERED?.logprobs || null);
         }
         const features = resp.features?.map((f) => ({
           modelId: f.modelId,
@@ -280,15 +278,33 @@ export default function Steerer({
       });
   }
 
+  // A dashboard neuron has no Neuron row until a saved steer makes one, so the feature API gives 404.
+  async function fetchFeatureToSteer(
+    featureModelId: string,
+    layer: string,
+    index: string,
+  ): Promise<NeuronWithPartialRelations> {
+    const response = await fetch(`/api/feature/${featureModelId}/${layer}/${index}`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (response.ok) {
+      return response.json();
+    }
+    if (
+      response.status === 404 &&
+      isSteerableNeuronLayer(getSourceSet(featureModelId, NEURONS_SOURCESET), getSource(featureModelId, layer))
+    ) {
+      return emptyNeuron(featureModelId, layer, index, NEURONS_SOURCESET);
+    }
+    throw new Error(`Could not get feature ${featureModelId}/${layer}/${index}: ${response.status}`);
+  }
+
   async function setInitialSteerFeatureFromSourceAndIndex(source: string, index: string) {
     // use the searchparams "source" and "index" to set the initial steering configuration
     setIsSteering(true);
     reset();
-    await fetch(`/api/feature/${modelId}/${source}/${index}`, {
-      method: 'GET',
-      headers: { 'Content-Type': 'application/json' },
-    })
-      .then((response) => response.json())
+    await fetchFeatureToSteer(modelId, source, index)
       .then((resp: NeuronWithPartialRelations) => {
         setIsSteering(false);
         const feature = {
@@ -328,7 +344,7 @@ export default function Steerer({
       }
       setTemperature(STEER_TEMPERATURE);
       setStrMultiple(STEER_STRENGTH_MULTIPLIER);
-      setFreqPenalty(STEER_FREQUENCY_PENALTY);
+      setPresencePenalty(STEER_PRESENCE_PENALTY);
       setRandomSeed(false);
       setSteerMethod(STEER_METHOD);
       reset();
@@ -544,6 +560,7 @@ export default function Steerer({
                   showModel={false}
                   defaultModelId={replaceSteerModelIdIfNeeded(modelId)}
                   filterToInferenceEnabled
+                  includeSteerableNeurons
                   defaultSourceSet={
                     getFirstSourceSetForModel(
                       globalModels[replaceSteerModelIdIfNeeded(modelId)],
@@ -554,11 +571,7 @@ export default function Steerer({
                   }
                   exclusiveCallback
                   callback={async (feature) => {
-                    await fetch(`/api/feature/${feature.modelId}/${feature.layer}/${feature.index}`, {
-                      method: 'GET',
-                      headers: { 'Content-Type': 'application/json' },
-                    })
-                      .then((response) => response.json())
+                    await fetchFeatureToSteer(feature.modelId, feature.layer, feature.index)
                       .then((n: NeuronWithPartialRelations) => {
                         addToSelectedFeatures({
                           modelId: feature.modelId,
@@ -611,20 +624,24 @@ export default function Steerer({
           </div>
         ) : (
           <div className="flex flex-1 flex-col">
-            <div className="mb-0.5 mt-4 text-left text-[10px] font-medium uppercase text-slate-500">
-              Select a Preset
-            </div>
-            <SteerPresetSelector
-              loadingPresets={loadingPresets}
-              featurePresets={featurePresets}
-              presetIsSelected={presetIsSelected}
-              selectedFeatures={selectedFeatures}
-              setSelectedFeatures={setSelectedFeatures}
-              setSteerMethod={setSteerMethod}
-              setShowSettingsOnMobile={setShowSettingsOnMobile}
-              deleteUserVector={deleteUserVector}
-              loadSavedSteerOutput={loadSavedSteerOutput}
-            />
+            {(loadingPresets || featurePresets.length > 0) && (
+              <>
+                <div className="mb-0.5 mt-4 text-left text-[10px] font-medium uppercase text-slate-500">
+                  Select a Preset
+                </div>
+                <SteerPresetSelector
+                  loadingPresets={loadingPresets}
+                  featurePresets={featurePresets}
+                  presetIsSelected={presetIsSelected}
+                  selectedFeatures={selectedFeatures}
+                  setSelectedFeatures={setSelectedFeatures}
+                  setSteerMethod={setSteerMethod}
+                  setShowSettingsOnMobile={setShowSettingsOnMobile}
+                  deleteUserVector={deleteUserVector}
+                  loadSavedSteerOutput={loadSavedSteerOutput}
+                />
+              </>
+            )}
 
             <div className="mb-0.5 mt-5 text-left text-[10px] font-medium uppercase text-slate-500">What to Steer</div>
             <div className="mt-2 flex w-full flex-row items-center justify-center gap-x-2">
@@ -642,7 +659,7 @@ export default function Steerer({
                 className="flex-1 border-slate-300 text-slate-500"
                 variant="outline"
               >
-                + Add Feature
+                + Add Feature/Neuron
               </Button>
               <Button
                 onClick={() => {
@@ -688,8 +705,8 @@ export default function Steerer({
             setSteerTokens={setSteerTokens}
             temperature={temperature}
             setTemperature={setTemperature}
-            freqPenalty={freqPenalty}
-            setFreqPenalty={setFreqPenalty}
+            presencePenalty={presencePenalty}
+            setPresencePenalty={setPresencePenalty}
             strMultiple={strMultiple}
             setStrMultiple={setStrMultiple}
             seed={seed}
@@ -725,6 +742,8 @@ export default function Steerer({
         <SteerCompletion
           showSettingsOnMobile={showSettingsOnMobile}
           isSteering={isSteering}
+          completionPrompt={completionPrompt}
+          setCompletionPrompt={setCompletionPrompt}
           defaultCompletionText={defaultCompletionText}
           defaultCompletionLogProbs={defaultCompletionLogProbs}
           setDefaultCompletionLogProbs={setDefaultCompletionLogProbs}
@@ -741,7 +760,7 @@ export default function Steerer({
           setUrl={setUrl}
           temperature={temperature}
           steerTokens={steerTokens}
-          freqPenalty={freqPenalty}
+          presencePenalty={presencePenalty}
           randomSeed={randomSeed}
           seed={seed}
           strMultiple={strMultiple}
@@ -769,7 +788,7 @@ export default function Steerer({
           setUrl={setUrl}
           temperature={temperature}
           steerTokens={steerTokens}
-          freqPenalty={freqPenalty}
+          presencePenalty={presencePenalty}
           randomSeed={randomSeed}
           seed={seed}
           strMultiple={strMultiple}

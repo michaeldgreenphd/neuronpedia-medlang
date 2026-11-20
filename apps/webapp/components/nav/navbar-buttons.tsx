@@ -9,7 +9,7 @@ import JumpToSAE from '@/components/jump-to-sae';
 import { useGlobalContext } from '@/components/provider/global-provider';
 import RandomReleaseFeature from '@/components/random-release-feature';
 import { DEFAULT_MODELID, DEFAULT_SOURCE, DEMO_MODE, IS_LOCALHOST } from '@/lib/env';
-import { getSourceSetNameFromSource, NEURONS_SOURCESET } from '@/lib/utils/source';
+import { getDefaultSourceForModel, getSourceSetNameFromSource, NEURONS_SOURCESET } from '@/lib/utils/source';
 import { SourceReleaseWithPartialRelations } from '@/prisma/generated/zod';
 import { useRouter } from '@bprogress/next';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
@@ -18,21 +18,15 @@ import { ChevronDown, ChevronDownIcon, ChevronUpIcon, MessagesSquare, Plus, RssI
 import Link from 'next/link';
 import { useState } from 'react';
 import InferenceActivationAllProvider from '../provider/inference-activation-all-provider';
-import ModelsDropdown from './models-dropdown';
 import ReleasesDropdown from './releases-dropdown';
 
 export default function NavBarButtons() {
   const router = useRouter();
-  const { getSourceSetsForModelId, globalModels, releases, getDefaultModel, getFirstSourceForSourceSet } =
-    useGlobalContext();
+  const { getSourceSetsForModelId, globalModels, releases, getDefaultModel } = useGlobalContext();
   const [jumpToOpen, setJumpToOpen] = useState(false);
   const [jumpToModelModelId, setJumpToModelModelId] = useState(DEFAULT_MODELID || getDefaultModel()?.id || '');
 
-  const defaultSource =
-    DEFAULT_SOURCE ||
-    (getSourceSetsForModelId(jumpToModelModelId, true).length > 0
-      ? getFirstSourceForSourceSet(jumpToModelModelId, getSourceSetsForModelId(jumpToModelModelId, true)[0].name)
-      : '');
+  const defaultSource = DEFAULT_SOURCE || getDefaultSourceForModel(globalModels[jumpToModelModelId], true)?.id || '';
 
   return (
     <>
@@ -47,15 +41,25 @@ export default function NavBarButtons() {
       )}
 
       <Link
+        href="/qwen3.6-27b/jlens"
+        className="relative flex cursor-pointer items-center whitespace-nowrap rounded-full px-2.5 py-1 text-[13px] transition-all hover:bg-sky-100 hover:text-sky-700 focus:outline-none data-[state=open]:bg-sky-700 data-[state=open]:text-white"
+      >
+        Jacobian Lens
+        <span className="absolute -right-1 -top-1.5 flex h-3.5 w-8 items-center justify-center rounded-full bg-red-600 text-[8px] font-bold text-white">
+          NEW
+        </span>
+      </Link>
+
+      <Link
         href="/llama3.3-70b-it/nla"
         className="relative flex cursor-pointer items-center whitespace-nowrap rounded-full px-2.5 py-1 text-[13px] transition-all hover:bg-sky-100 hover:text-sky-700 focus:outline-none data-[state=open]:bg-sky-700 data-[state=open]:text-white"
       >
-        <div className="flex flex-col items-center justify-center px-1 text-xs font-normal leading-tight sm:text-[11.5px]">
+        <div className="flex flex-col items-center justify-center gap-y-[1px] px-1 text-xs font-normal leading-tight sm:text-[11px]">
           <div>Natural Language</div>
           <div>Autoencoders</div>
         </div>
-        <span className="absolute -right-1.5 -top-1 flex h-3.5 w-8 items-center justify-center rounded-full bg-red-600 text-[8px] font-bold text-white">
-          NEW
+        <span className="absolute -right-1 -top-1 flex h-3.5 items-center justify-center whitespace-nowrap rounded-full bg-emerald-600 px-1.5 text-[8px] font-semibold text-white">
+          MAY 26
         </span>
       </Link>
 
@@ -64,8 +68,8 @@ export default function NavBarButtons() {
         className="relative flex cursor-pointer items-center whitespace-nowrap rounded-full px-2.5 py-1 text-[13px] transition-all hover:bg-sky-100 hover:text-sky-700 focus:outline-none data-[state=open]:bg-sky-700 data-[state=open]:text-white"
       >
         Assistant Axis
-        <span className="absolute -right-2 -top-1.5 flex h-3.5 w-8 items-center justify-center rounded-full bg-red-600 text-[8px] font-bold text-white">
-          NEW
+        <span className="absolute -right-1 -top-1.5 flex h-3.5 items-center justify-center whitespace-nowrap rounded-full bg-emerald-600 px-1.5 text-[8px] font-semibold text-white">
+          JAN 26
         </span>
       </Link>
 
@@ -74,8 +78,8 @@ export default function NavBarButtons() {
         className="relative flex cursor-pointer items-center whitespace-nowrap rounded-full px-2.5 py-1 text-[13px] transition-all hover:bg-sky-100 hover:text-sky-700 focus:outline-none data-[state=open]:bg-sky-700 data-[state=open]:text-white"
       >
         Circuit Tracer
-        <span className="absolute -right-1 -top-1.5 flex h-3.5 w-11 items-center justify-center rounded-full bg-red-600 text-[8px] font-bold text-white">
-          UPDATE
+        <span className="absolute -right-1 -top-1.5 flex h-3.5 items-center justify-center whitespace-nowrap rounded-full bg-emerald-600 px-1.5 text-[8px] font-semibold text-white">
+          APR 26
         </span>
       </Link>
 
@@ -176,6 +180,8 @@ export default function NavBarButtons() {
         </DropdownMenu.Portal>
       </DropdownMenu.Root>
 
+      {/* <ModelsDropdown isInBreadcrumb={false} /> */}
+
       <DropdownMenu.Root>
         <DropdownMenu.Trigger className="flex cursor-pointer items-center whitespace-nowrap rounded-full px-1.5 py-1 text-[13px] transition-all hover:bg-sky-100 hover:text-sky-700 focus:outline-none data-[state=open]:bg-sky-700 data-[state=open]:text-white">
           Search
@@ -244,13 +250,17 @@ export default function NavBarButtons() {
         </DropdownMenu.Portal>
       </DropdownMenu.Root>
 
-      <ModelsDropdown isInBreadcrumb={false} />
-
       <Select.Root
         defaultValue="saes"
         value="saes"
         onValueChange={(newVal) => {
-          router.push(`/${newVal.replace('|', '/')}`);
+          // Item values are `${modelId}|${sourceSetName}`; the placeholder item has no delimiter.
+          const [modelId, sourceSetName] = newVal.split('|');
+          router.push(
+            sourceSetName
+              ? `/${encodeURIComponent(modelId)}/${encodeURIComponent(sourceSetName)}`
+              : `/${encodeURIComponent(modelId)}`,
+          );
         }}
       >
         <Select.Trigger className="hidden w-full flex-1 select-none flex-row items-center justify-center gap-x-1 whitespace-pre rounded px-0 text-[13px] hover:text-sky-700 hover:underline focus:outline-none sm:pl-1 sm:uppercase">
@@ -333,7 +343,7 @@ export default function NavBarButtons() {
           href="/sae-bench"
           prefetch={false}
           rel="noreferrer"
-          className="flex cursor-pointer items-center whitespace-nowrap rounded-full px-1.5 py-1 text-[13px] transition-all hover:bg-sky-100 hover:text-sky-700 focus:outline-none data-[state=open]:bg-sky-700 data-[state=open]:text-white"
+          className="flex hidden cursor-pointer items-center whitespace-nowrap rounded-full px-1.5 py-1 text-[13px] transition-all hover:bg-sky-100 hover:text-sky-700 focus:outline-none data-[state=open]:bg-sky-700 data-[state=open]:text-white"
         >
           SAE Evals
         </Link>
@@ -348,8 +358,20 @@ export default function NavBarButtons() {
         Exports
       </Link>
 
+      <Link
+        href="https://interp-engine.org"
+        target="_blank"
+        rel="noreferrer"
+        className="relative flex cursor-pointer items-center whitespace-nowrap rounded-full px-1.5 py-1 text-[13px] transition-all hover:bg-sky-100 hover:text-sky-700 focus:outline-none data-[state=open]:bg-sky-700 data-[state=open]:text-white"
+      >
+        interp-engine
+        <span className="absolute -right-1 -top-1.5 flex h-3.5 w-8 items-center justify-center rounded-full bg-red-600 text-[8px] font-bold text-white">
+          NEW
+        </span>
+      </Link>
+
       <DropdownMenu.Root>
-        <DropdownMenu.Trigger className="flex cursor-pointer items-center whitespace-nowrap rounded-full px-1.5 py-1 text-[13px] transition-all hover:bg-sky-100 hover:text-sky-700 focus:outline-none data-[state=open]:bg-sky-700 data-[state=open]:text-white">
+        <DropdownMenu.Trigger className="flex hidden cursor-pointer items-center whitespace-nowrap rounded-full px-1.5 py-1 text-[13px] transition-all hover:bg-sky-100 hover:text-sky-700 focus:outline-none data-[state=open]:bg-sky-700 data-[state=open]:text-white">
           Guides
           <ChevronDown className="-mr-0.5 ml-0.5 h-3.5 w-3.5" />
         </DropdownMenu.Trigger>
@@ -407,17 +429,43 @@ export default function NavBarButtons() {
         </DropdownMenu.Portal>
       </DropdownMenu.Root>
 
-      <Link
-        href="/api-doc"
-        prefetch={false}
-        rel="noreferrer"
-        className="flex cursor-pointer items-center whitespace-nowrap rounded-full px-1.5 py-1 pr-2.5 text-[13px] transition-all hover:bg-sky-100 hover:text-sky-700 focus:outline-none data-[state=open]:bg-sky-700 data-[state=open]:text-white"
-      >
-        API
-      </Link>
+      <DropdownMenu.Root>
+        <DropdownMenu.Trigger className="flex cursor-pointer items-center whitespace-nowrap rounded-full px-1.5 py-1 pr-2.5 text-[13px] transition-all hover:bg-sky-100 hover:text-sky-700 focus:outline-none data-[state=open]:bg-sky-700 data-[state=open]:text-white">
+          Docs
+          <ChevronDown className="-mr-0.5 ml-0.5 h-3.5 w-3.5" />
+        </DropdownMenu.Trigger>
+        <DropdownMenu.Portal>
+          <DropdownMenu.Content
+            sideOffset={-3}
+            className="z-50 min-w-[8rem] overflow-hidden rounded-md bg-white p-1 shadow-[0px_10px_38px_-10px_rgba(22,_23,_24,_0.35),_0px_10px_20px_-15px_rgba(22,_23,_24,_0.2)]"
+          >
+            <DropdownMenu.Item asChild>
+              <Link
+                href="https://docs.neuronpedia.org"
+                target="_blank"
+                prefetch={false}
+                rel="noreferrer"
+                className="flex cursor-pointer items-center rounded px-4 py-2 text-[13px] font-medium text-sky-700 outline-none hover:bg-sky-100 focus:bg-sky-100"
+              >
+                Docs
+              </Link>
+            </DropdownMenu.Item>
+            <DropdownMenu.Item asChild>
+              <Link
+                href="/api-doc"
+                prefetch={false}
+                className="flex cursor-pointer items-center rounded px-4 py-2 text-[13px] font-medium text-sky-700 outline-none hover:bg-sky-100 focus:bg-sky-100"
+              >
+                API
+              </Link>
+            </DropdownMenu.Item>
+            <DropdownMenu.Arrow className="fill-white" />
+          </DropdownMenu.Content>
+        </DropdownMenu.Portal>
+      </DropdownMenu.Root>
 
       <Link
-        href="https://join.slack.com/t/opensourcemechanistic/shared_invite/zt-3z9o0hxjl-MDX9pbATO2qESOazNDLpdQ"
+        href="https://join.slack.com/t/opensourcemechanistic/shared_invite/zt-4fi8qynnl-n2QrsTx3eJZHFHJ3Qzab4A"
         target="_blank"
         rel="noreferrer"
         className="flex cursor-pointer items-center whitespace-nowrap rounded-full bg-emerald-100 px-3 py-1 text-[13px] font-medium text-emerald-700 transition-all hover:bg-emerald-200 hover:text-emerald-700 focus:outline-none data-[state=open]:bg-emerald-700 data-[state=open]:text-white sm:mr-1"

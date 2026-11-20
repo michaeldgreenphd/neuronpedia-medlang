@@ -5,9 +5,6 @@
 /.pnp
 .pnp.js
 
-# testing
-/coverage
-
 # next.js
 /.next/
 /out/
@@ -32,7 +29,6 @@ yarn-error.log*
 !.env.demo
 !.env.localhost
 !.env.example
-!.env.playwright
 .env.apple.*
 
 # vercel
@@ -68,10 +64,14 @@ firebase-debug.log
 # temp files
 /tmp/
 
-# Playwright
+# Snapshots of the Vector table, e.g. `pg_dump -t '"Vector"' --data-only`: a handful of directions
+# is megabytes of floats, and a copy of rows is not something to version.
+vectors*.json
+
+# nested dependencies
 node_modules/
-/test-results/
-/test-results/*
-/playwright-report/
-/blob-report/
-/playwright/.cache/
+
+/.api-compare/
+
+/public/ignore.json
+/public/ignore2.json

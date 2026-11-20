@@ -4,10 +4,10 @@ import { prisma } from '@/lib/db';
 import { importConfigFromS3, importJsonlString } from '@/lib/db/import';
 import { IS_LOCALHOST } from '@/lib/env';
 import {
-  DATASET_BASE_PATH,
   downloadAndDecompressFile,
   downloadFileJsonlParsedLines,
   getFilesInPath,
+  getS3SourcePath,
 } from '@/lib/utils/s3';
 import { getAuthedAdminUser, RequestAuthedAdminUser, RequestOptionalUser, withOptionalUser } from '@/lib/with-user';
 import { NextResponse } from 'next/server';
@@ -31,6 +31,7 @@ export const GET = withOptionalUser(async (request: RequestOptionalUser) => {
   const modelId = searchParams.get('modelId');
   const sourceId = searchParams.get('sourceId');
   const explanations = searchParams.get('explanations') || ExplanationImportType.TRUE;
+  const tokenLists = searchParams.get('tokenLists') !== 'false';
   const explanationBatchStartParam = searchParams.get('explanationBatchStart');
   let explanationBatchStart: number | null = null;
   if (!modelId || !sourceId) {
@@ -45,7 +46,7 @@ export const GET = withOptionalUser(async (request: RequestOptionalUser) => {
     }
     explanationBatchStart = Number.parseInt(explanationBatchStartParam, 10);
   }
-  const path = `${DATASET_BASE_PATH}${modelId}/${sourceId}`;
+  const path = getS3SourcePath(modelId, sourceId);
   console.log('Importing data from', path);
 
   if (!IS_LOCALHOST && (!request.user || !(await getAuthedAdminUser(request as RequestAuthedAdminUser)))) {
@@ -141,41 +142,9 @@ export const GET = withOptionalUser(async (request: RequestOptionalUser) => {
             }
           }
 
-          /* INFERENCE HOST SOURCES */
-          try {
-            const inferenceHostSourceLines = await downloadFileJsonlParsedLines(`${path}/inference_hosts.jsonl`);
-            for (const line of inferenceHostSourceLines) {
-              await prisma.inferenceHostSource.upsert({
-                where: { id: line.id },
-                update: line,
-                create: line,
-              });
-            }
-          } catch (error) {
-            console.error('Error importing inference host sources:', error);
-          }
-
-          /* INFERENCE HOST SOURCE CONNECTIONS */
-          try {
-            const inferenceHostOnSourceLines = await downloadFileJsonlParsedLines(
-              `${path}/inference_hosts_on_source.jsonl`,
-            );
-            for (const line of inferenceHostOnSourceLines) {
-              await prisma.inferenceHostSourceOnSource.upsert({
-                where: {
-                  sourceId_sourceModelId_inferenceHostId: {
-                    inferenceHostId: line.inferenceHostId,
-                    sourceId: line.sourceId,
-                    sourceModelId: line.sourceModelId,
-                  },
-                },
-                update: line,
-                create: line,
-              });
-            }
-          } catch (error) {
-            console.error('Error importing inference host source connections:', error);
-          }
+          /* GPU hosts are deliberately not imported. They are specific to the
+             environment that runs them, and the exported rows carried a blank
+             host URL anyway. Register your own with `make host-add`. */
 
           /* FEATURES */
           const featuresPaths = await getFilesInPath(`${path}/features`, '.jsonl.gz');
@@ -254,6 +223,16 @@ export const GET = withOptionalUser(async (request: RequestOptionalUser) => {
             const endTime = new Date();
             const duration = (endTime.getTime() - startTime.getTime()) / 1000; // in seconds
             console.log(`Imported final batch of ${accumulatedLines.length} lines. Duration: ${duration} seconds`);
+          }
+        }
+
+        if (tokenLists) {
+          /* TOKEN LISTS */
+          const tokenListsPaths = await getFilesInPath(`${path}/token-lists/`, '.jsonl.gz');
+          for (const [index, tokenListsPath] of tokenListsPaths.entries()) {
+            enqueueProgress(controller, index / tokenListsPaths.length, `Importing Token Lists...`);
+            console.log('Importing token lists from', tokenListsPath);
+            await importJsonlString('NeuronTokenList', await downloadAndDecompressFile(tokenListsPath));
           }
         }
 

@@ -3,6 +3,7 @@
 import CustomTooltip from '@/components/custom-tooltip';
 import { Button } from '@/components/shadcn/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/shadcn/card';
+import { saeHasConfig } from '@/lib/utils/source';
 import { SourceWithPartialRelations } from '@/prisma/generated/zod';
 import { Prisma } from '@prisma/client';
 import copy from 'copy-to-clipboard';
@@ -164,6 +165,10 @@ export default function SaeLensConfigPane({
     sae.hfRepoId && sae.hfFolderId ? `https://huggingface.co/${sae.hfRepoId}/tree/main/${sae.hfFolderId}` : undefined;
 
   const [showMoreConfig, setShowMoreConfig] = useState(false);
+
+  if (!saeHasConfig(sae) && !(numPrompts && numTokensInPrompt) && !dashboardDataset) {
+    return null;
+  }
 
   return (
     <Card className="w-full bg-white">

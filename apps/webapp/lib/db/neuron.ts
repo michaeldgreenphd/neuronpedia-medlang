@@ -1,6 +1,6 @@
+import { ActivationAllResponse, ActivationTopkByTokenResponse } from '@/lib/api/inference-types';
 import { prisma } from '@/lib/db';
 import { Neuron } from '@prisma/client';
-import { ActivationAllPost200Response, ActivationTopkByTokenPost200Response } from 'neuronpedia-inference-client';
 import { NeuronWithPartialRelations } from 'prisma/generated/zod';
 import { PUBLIC_ACTIVATIONS_USER_IDS } from '../env';
 import { EXPLANATIONTYPE_HUMAN } from '../utils/autointerp';
@@ -213,6 +213,8 @@ export const getNeuronOptimized = async (
   layer: string,
   index: string,
   user: AuthenticatedUser | null = null,
+  // Loads only the top activations by max value. Omit to load all of them.
+  activationsLimit?: number,
 ) => {
   await assertUserCanAccessModelAndSource(modelId, layer, user);
 
@@ -250,6 +252,9 @@ export const getNeuronOptimized = async (
       },
     },
   });
+  if (!neuronResult) {
+    return null;
+  }
 
   // separate parallel queries instead of one query because Prisma creates insane requests to DB otherwise
   const activations = prisma.activation.findMany({
@@ -259,7 +264,7 @@ export const getNeuronOptimized = async (
       index,
       creatorId: {
         in:
-          neuronResult?.hasVector && neuronResult?.creatorId
+          neuronResult.hasVector && neuronResult.creatorId
             ? [neuronResult.creatorId].concat(PUBLIC_ACTIVATIONS_USER_IDS)
             : PUBLIC_ACTIVATIONS_USER_IDS,
       },
@@ -267,6 +272,7 @@ export const getNeuronOptimized = async (
     orderBy: {
       maxValue: 'desc',
     },
+    ...(activationsLimit ? { take: activationsLimit } : {}),
   });
   const explanations = prisma.explanation.findMany({
     where: { modelId, layer, index },
@@ -276,6 +282,25 @@ export const getNeuronOptimized = async (
       explanationModelName: true,
       typeName: true,
       scores: true,
+      pole: true,
+      aspect: true,
+      steerStrength: true,
+      sourceUrl: true,
+      contributorName: true,
+      contributorUrl: true,
+      metadata: true,
+      type: {
+        select: {
+          displayName: true,
+          description: true,
+          url: true,
+          creatorName: true,
+          settings: true,
+          license: true,
+          licenseUrl: true,
+          citation: true,
+        },
+      },
       triggeredByUser: {
         select: {
           id: true,
@@ -285,19 +310,42 @@ export const getNeuronOptimized = async (
     },
     orderBy: [{ scoreV2: 'desc' }, { scoreV1: 'desc' }],
   });
-  const res = await Promise.all([activations, explanations]); // , comments]);
-  if (!res || !neuronResult) {
-    return null;
-  }
+  const tokenLists = prisma.neuronTokenList.findMany({
+    where: { modelId, layer, index },
+    select: {
+      id: true,
+      typeName: true,
+      name: true,
+      pole: true,
+      aspect: true,
+      tokens: true,
+      values: true,
+      metadata: true,
+      type: {
+        select: {
+          displayName: true,
+          description: true,
+          url: true,
+          creatorName: true,
+          license: true,
+          licenseUrl: true,
+          citation: true,
+        },
+      },
+    },
+    orderBy: [{ typeName: 'asc' }, { name: 'asc' }, { pole: 'asc' }],
+  });
+  const res = await Promise.all([activations, explanations, tokenLists]); // , comments]);
   const neuron = neuronResult as NeuronWithPartialRelations;
   // this does not work correctly, so always set it to blank
   neuron.correlated_features_indices = [];
   neuron.correlated_features_l1 = [];
   neuron.correlated_features_pearson = [];
 
-  const [acts, exps] = res;
+  const [acts, exps, lists] = res;
   neuron.activations = acts;
   neuron.explanations = exps;
+  neuron.tokenLists = lists as NeuronWithPartialRelations['tokenLists'];
 
   return neuron;
 };
@@ -344,7 +392,7 @@ export const deleteNeuron = async (modelId: string, layer: string, index: string
 export const getNeuronsForSearcher = async (
   modelId: string,
   sourceSet: string,
-  result: ActivationAllPost200Response,
+  result: ActivationAllResponse,
   user: AuthenticatedUser | null = null,
 ) => {
   // we already checked at /search-all, but check here again anyway in case someone tries to use this method directly
@@ -390,7 +438,7 @@ export const getNeuronsForSearcher = async (
 export const getNeuronsForTopkSearcherExplanationOnly = async (
   modelId: string,
   source: string,
-  result: ActivationTopkByTokenPost200Response,
+  result: ActivationTopkByTokenResponse,
   user: AuthenticatedUser | null = null,
 ) => {
   // we already checked at /search-all, but check here again anyway in case someone tries to use this method directly

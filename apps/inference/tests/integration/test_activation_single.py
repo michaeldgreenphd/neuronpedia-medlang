@@ -1,15 +1,12 @@
 import pytest
 from fastapi.testclient import TestClient
-from neuronpedia_inference_client.models.activation_single_post200_response import (
-    ActivationSinglePost200Response,
-)
-from neuronpedia_inference_client.models.activation_single_post_request import (
-    ActivationSinglePostRequest,
-)
 
+from neuronpedia_inference.schemas import (
+    ActivationSingleRequest,
+    ActivationSingleResponse,
+)
 from tests.conftest import (
     ABS_TOLERANCE,
-    BOS_TOKEN_STR,
     MODEL_ID,
     SAE_SELECTED_SOURCES,
     TEST_PROMPT,
@@ -23,7 +20,7 @@ def test_activation_single_with_source_and_index(client: TestClient):
     """
     Test the /activation/single endpoint with source and index parameters.
     """
-    request = ActivationSinglePostRequest(
+    request = ActivationSingleRequest(
         prompt=TEST_PROMPT,
         model=MODEL_ID,
         source=SAE_SELECTED_SOURCES[0],
@@ -40,25 +37,45 @@ def test_activation_single_with_source_and_index(client: TestClient):
 
     # Validate the structure with Pydantic model
     data = response.json()
-    response_model = ActivationSinglePost200Response(**data)
+    response_model = ActivationSingleResponse(**data)
 
-    # Check activation values
-    expected_activations = [134.71969604492188, 0.051671065390110016, 0.0, 0.0, 0.0]
-    expected_max_value = 134.71969604492188
+    # Check activation values. The engine strips the BOS position from the returned
+    # activations/tokens (matching the vector/hook path below), so this is the 4-token
+    # ["Hello", ",", " world", "!"] sequence.
+    expected_activations = [0.04774539917707443, 0.0, 0.0, 0.0]
+    expected_max_value = 0.04774539917707443
     expected_max_value_index = 0
-    assert (
-        pytest.approx(response_model.activation.values, abs=ABS_TOLERANCE)
-        == expected_activations
-    )
-    assert (
-        pytest.approx(response_model.activation.max_value, abs=ABS_TOLERANCE)
-        == expected_max_value
-    )
+    assert pytest.approx(response_model.activation.values, abs=ABS_TOLERANCE) == expected_activations
+    assert pytest.approx(response_model.activation.max_value, abs=ABS_TOLERANCE) == expected_max_value
     assert response_model.activation.max_value_index == expected_max_value_index
 
     # Check tokens
-    expected_tokens = [BOS_TOKEN_STR, "Hello", ",", " world", "!"]
+    expected_tokens = ["Hello", ",", " world", "!"]
     assert response_model.tokens == expected_tokens
+
+
+def test_activation_single_for_mlp_neuron(client: TestClient):
+    """
+    An MLP neuron source ("0") has no SAE. Both endpoints must serve it, without the BOS position,
+    and the batch result must match the single one.
+    """
+    body = {"model": MODEL_ID, "source": "0", "index": "10"}
+    single = client.post(ENDPOINT, json={**body, "prompt": TEST_PROMPT}, headers={"X-SECRET-KEY": X_SECRET_KEY})
+    assert single.status_code == 200, single.text
+    single_model = ActivationSingleResponse(**single.json())
+    assert single_model.tokens == ["Hello", ",", " world", "!"]
+    assert len(single_model.activation.values) == 4
+    assert single_model.activation.max_value == max(single_model.activation.values)
+
+    batch = client.post(
+        f"{ENDPOINT}-batch",
+        json={**body, "prompts": [TEST_PROMPT, TEST_PROMPT]},
+        headers={"X-SECRET-KEY": X_SECRET_KEY},
+    )
+    assert batch.status_code == 200, batch.text
+    for result in batch.json()["results"]:
+        assert result["tokens"] == single_model.tokens
+        assert pytest.approx(result["activation"]["values"], abs=ABS_TOLERANCE) == single_model.activation.values
 
 
 def test_activation_single_with_vector_and_hook(client: TestClient):
@@ -69,7 +86,7 @@ def test_activation_single_with_vector_and_hook(client: TestClient):
     test_vector = [0.1] * 768
     test_hook = "blocks.0.hook_resid_post"  # _pre works here too
 
-    request = ActivationSinglePostRequest(
+    request = ActivationSingleRequest(
         prompt=TEST_PROMPT,
         model=MODEL_ID,
         vector=test_vector,
@@ -86,20 +103,14 @@ def test_activation_single_with_vector_and_hook(client: TestClient):
 
     # Validate the structure with Pydantic model
     data = response.json()
-    response_model = ActivationSinglePost200Response(**data)
+    response_model = ActivationSingleResponse(**data)
 
     # Check activation values
     expected_activations = [5.4140625, 3.23828125, 1.9462890625, 1.671875]
     expected_max_value = 5.4140625
     expected_max_value_index = 0
-    assert (
-        pytest.approx(response_model.activation.values, abs=ABS_TOLERANCE)
-        == expected_activations
-    )
-    assert (
-        pytest.approx(response_model.activation.max_value, abs=ABS_TOLERANCE)
-        == expected_max_value
-    )
+    assert pytest.approx(response_model.activation.values, abs=ABS_TOLERANCE) == expected_activations
+    assert pytest.approx(response_model.activation.max_value, abs=ABS_TOLERANCE) == expected_max_value
     assert response_model.activation.max_value_index == expected_max_value_index
 
     # Check token values

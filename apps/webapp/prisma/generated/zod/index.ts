@@ -11,37 +11,43 @@ import { Prisma } from '@prisma/client';
 export type NullableJsonInput = Prisma.JsonValue | null | 'JsonNull' | 'DbNull' | Prisma.NullTypes.DbNull | Prisma.NullTypes.JsonNull;
 
 export const transformJsonNull = (v?: NullableJsonInput) => {
-  if (!v || v === 'DbNull') return Prisma.DbNull;
-  if (v === 'JsonNull') return Prisma.JsonNull;
+  if (!v || v === 'DbNull') return Prisma.NullTypes.DbNull;
+  if (v === 'JsonNull') return Prisma.NullTypes.JsonNull;
   return v;
 };
 
-export const JsonValue: z.ZodType<Prisma.JsonValue> = z.union([
-  z.string(),
-  z.number(),
-  z.boolean(),
-  z.lazy(() => z.array(JsonValue)),
-  z.lazy(() => z.record(JsonValue)),
-]);
+export const JsonValueSchema: z.ZodType<Prisma.JsonValue> = z.lazy(() =>
+  z.union([
+    z.string(),
+    z.number(),
+    z.boolean(),
+    z.literal(null),
+    z.record(z.string(), z.lazy(() => JsonValueSchema.optional())),
+    z.array(z.lazy(() => JsonValueSchema)),
+  ])
+);
 
-export type JsonValueType = z.infer<typeof JsonValue>;
+export type JsonValueType = z.infer<typeof JsonValueSchema>;
 
 export const NullableJsonValue = z
-  .union([JsonValue, z.literal('DbNull'), z.literal('JsonNull')])
+  .union([JsonValueSchema, z.literal('DbNull'), z.literal('JsonNull')])
   .nullable()
   .transform((v) => transformJsonNull(v));
 
 export type NullableJsonValueType = z.infer<typeof NullableJsonValue>;
 
-export const InputJsonValue: z.ZodType<Prisma.InputJsonValue> = z.union([
-  z.string(),
-  z.number(),
-  z.boolean(),
-  z.lazy(() => z.array(InputJsonValue.nullable())),
-  z.lazy(() => z.record(InputJsonValue.nullable())),
-]);
+export const InputJsonValueSchema: z.ZodType<Prisma.InputJsonValue> = z.lazy(() =>
+  z.union([
+    z.string(),
+    z.number(),
+    z.boolean(),
+    z.object({ toJSON: z.any() }),
+    z.record(z.string(), z.lazy(() => z.union([InputJsonValueSchema, z.literal(null)]))),
+    z.array(z.lazy(() => z.union([InputJsonValueSchema, z.literal(null)]))),
+  ])
+);
 
-export type InputJsonValueType = z.infer<typeof InputJsonValue>;
+export type InputJsonValueType = z.infer<typeof InputJsonValueSchema>;
 
 
 /////////////////////////////////////////
@@ -58,13 +64,17 @@ export const SessionScalarFieldEnumSchema = z.enum(['id','sessionToken','userId'
 
 export const UserSecretScalarFieldEnumSchema = z.enum(['id','username','type','value','createdAt','updatedAt']);
 
-export const UserScalarFieldEnumSchema = z.enum(['id','name','bio','email','emailVerified','githubUsername','bot','image','admin','canTriggerExplanations','isProblemEditor','emailNewsletterNotification','emailUnsubscribeAll','emailUnsubscribeCode','createdAt']);
+export const UserScalarFieldEnumSchema = z.enum(['id','name','bio','email','emailVerified','githubUsername','bot','image','admin','canTriggerExplanations','canUploadExplanations','isProblemEditor','emailNewsletterNotification','emailUnsubscribeAll','emailUnsubscribeCode','emailSuppressedReason','emailSuppressedAt','createdAt']);
 
 export const GraphMetadataSubgraphScalarFieldEnumSchema = z.enum(['id','displayName','graphMetadataId','pinnedIds','supernodes','clerps','pruningThreshold','densityThreshold','userId','isFeaturedSolution','createdAt','updatedAt']);
 
 export const GraphMetadataScalarFieldEnumSchema = z.enum(['id','modelId','sourceSetName','slug','promptTokens','prompt','titlePrefix','isFeatured','url','userId','createdAt','updatedAt']);
 
 export const GraphMetadataDataPutRequestScalarFieldEnumSchema = z.enum(['id','ipAddress','filename','url','userId','createdAt']);
+
+export const JlensShareScalarFieldEnumSchema = z.enum(['id','kind','modelId','url','description','lockedTokens','selectedPositions','lensColumns','activeLensModeTab','topN','hideNonWordTokens','temperature','numCompletionTokens','steerToken','steerType','steerLayers','steerStrength','steerAblate','steerMode','swapToken','steerGenerated','numPromptTokens','userId','createdAt','updatedAt']);
+
+export const JlensSharePutRequestScalarFieldEnumSchema = z.enum(['id','ipAddress','filename','url','userId','createdAt']);
 
 export const ListCommentScalarFieldEnumSchema = z.enum(['id','listId','text','userId','createdAt']);
 
@@ -76,23 +86,23 @@ export const ListsOnActivationsScalarFieldEnumSchema = z.enum(['activationId','l
 
 export const VerificationTokenScalarFieldEnumSchema = z.enum(['identifier','token','expires']);
 
-export const ModelScalarFieldEnumSchema = z.enum(['id','displayNameShort','displayName','creatorId','tlensId','openRouterId','dimension','thinking','visibility','defaultSourceSetName','defaultSourceId','defaultGraphSourceSetName','inferenceEnabled','instruct','layers','neuronsPerLayer','createdAt','owner','updatedAt','website']);
+export const SignInEmailLogScalarFieldEnumSchema = z.enum(['id','to','toKey','sentAt']);
+
+export const ModelScalarFieldEnumSchema = z.enum(['id','displayNameShort','displayName','creatorId','tlensId','openRouterId','hfRepoId','dimension','thinking','visibility','defaultSourceSetName','defaultSourceId','defaultGraphSourceSetName','inferenceEnabled','instruct','layers','neuronsPerLayer','createdAt','owner','updatedAt','website']);
 
 export const ModelHeadMetricsScalarFieldEnumSchema = z.enum(['id','modelId','layer','headIndex','modelName','datasetName','nSequences','seqLen','dtype','attnImplementation','selfAttentionScore','prevTokenScore','patternEntropy','qkDistance','qkDistanceVariance','inductionScore','qkDistanceHistogram','topQueryTokens','topKeyTokens','activationHistogram','headStatistics','createdAt','updatedAt']);
 
 export const ModelHeadSequenceScalarFieldEnumSchema = z.enum(['id','modelId','layer','headIndex','modelName','datasetName','nSequences','dtype','attnImplementation','interval','tokens','attentionIndices','attentionValues','maxActivation','createdAt','updatedAt']);
 
-export const GraphHostSourceScalarFieldEnumSchema = z.enum(['id','name','hostUrl','runpodServerlessUrl','modelId','createdAt','updatedAt']);
+export const ComputeHostScalarFieldEnumSchema = z.enum(['id','name','hostUrl','service','provider','providerRef','modelId','nlaSourceId','createdAt','updatedAt']);
 
-export const GraphHostSourceOnSourceSetScalarFieldEnumSchema = z.enum(['sourceSetName','sourceSetModelId','graphHostSourceId']);
+export const ComputeHostOnSourceScalarFieldEnumSchema = z.enum(['sourceId','sourceModelId','computeHostId']);
 
-export const InferenceHostSourceScalarFieldEnumSchema = z.enum(['id','name','hostUrl','engine','modelId','runpodServerlessUrl','createdAt','updatedAt']);
-
-export const InferenceHostSourceOnSourceScalarFieldEnumSchema = z.enum(['sourceId','sourceModelId','inferenceHostId']);
+export const ComputeHostOnSourceSetScalarFieldEnumSchema = z.enum(['sourceSetName','sourceSetModelId','computeHostId']);
 
 export const SourceScalarFieldEnumSchema = z.enum(['id','modelId','hasDashboards','inferenceEnabled','saelensConfig','saelensRelease','saelensSaeId','hfRepoId','hfFolderId','visibility','defaultOfModelId','setName','creatorId','hasUmap','hasUmapLogSparsity','hasUmapClusters','num_prompts','num_tokens_in_prompt','dataset','notes','cosSimMatchModelId','cosSimMatchSourceId','createdAt']);
 
-export const SourceSetScalarFieldEnumSchema = z.enum(['modelId','name','hasDashboards','allowInferenceSearch','visibility','description','type','creatorName','urls','creatorEmail','creatorId','releaseName','hasGraphs','graphEnabled','similarityMatrixEnabled','defaultOfModelId','defaultGraphModelId','defaultRange','defaultShowBreaks','showDfa','showCorrelated','showHeadAttribution','showUmap','createdAt']);
+export const SourceSetScalarFieldEnumSchema = z.enum(['modelId','name','hasDashboards','allowInferenceSearch','visibility','description','type','creatorName','urls','creatorEmail','creatorId','releaseName','hasGraphs','graphEnabled','similarityMatrixEnabled','defaultOfModelId','defaultGraphModelId','defaultRange','defaultShowBreaks','showDfa','showCorrelated','showHeadAttribution','showUmap','externalDashboardsUrl','createdAt']);
 
 export const SourceReleaseScalarFieldEnumSchema = z.enum(['name','visibility','isNewUi','featured','description','descriptionShort','urls','creatorEmail','creatorName','creatorNameShort','creatorId','defaultSourceSetName','defaultSourceId','defaultUmapSourceIds','createdAt']);
 
@@ -102,13 +112,15 @@ export const EvalTypeScalarFieldEnumSchema = z.enum(['name','displayName','descr
 
 export const NeuronScalarFieldEnumSchema = z.enum(['modelId','layer','index','sourceSetName','creatorId','createdAt','maxActApprox','hasVector','vector','vectorLabel','vectorDefaultSteerStrength','hookName','topkCosSimIndices','topkCosSimValues','neuron_alignment_indices','neuron_alignment_values','neuron_alignment_l1','correlated_neurons_indices','correlated_neurons_pearson','correlated_neurons_l1','correlated_features_indices','correlated_features_pearson','correlated_features_l1','neg_str','neg_values','pos_str','pos_values','frac_nonzero','freq_hist_data_bar_heights','freq_hist_data_bar_values','logits_hist_data_bar_heights','logits_hist_data_bar_values','decoder_weights_dist','umap_cluster','umap_log_feature_sparsity','umap_x','umap_y']);
 
-export const ExplanationScalarFieldEnumSchema = z.enum(['id','modelId','layer','index','description','authorId','triggeredByUserId','notes','scoreV1','scoreV2','umap_x','umap_y','umap_cluster','umap_log_feature_sparsity','typeName','explanationModelName','createdAt','updatedAt']);
+export const ExplanationScalarFieldEnumSchema = z.enum(['id','modelId','layer','index','description','authorId','triggeredByUserId','notes','scoreV1','scoreV2','umap_x','umap_y','umap_cluster','umap_log_feature_sparsity','typeName','explanationModelName','pole','aspect','steerStrength','sourceUrl','contributorName','contributorUrl','metadata','createdAt','updatedAt']);
 
 export const ExplanationModelSettingsScalarFieldEnumSchema = z.enum(['id','temperature','maxTokens','topP','frequencyPenalty']);
 
 export const ExplanationModelTypeScalarFieldEnumSchema = z.enum(['name','displayName','description','featured','openRouterModelId','url','creatorName','createdAt','updatedAt']);
 
-export const ExplanationTypeScalarFieldEnumSchema = z.enum(['name','displayName','description','featured','isAttention','explainerModelSettingsId','settings','url','creatorName','creatorId','createdAt','updatedAt']);
+export const ExplanationTypeScalarFieldEnumSchema = z.enum(['name','displayName','description','featured','isAttention','explainerModelSettingsId','settings','url','creatorName','creatorId','license','licenseUrl','citation','createdAt','updatedAt']);
+
+export const NeuronTokenListScalarFieldEnumSchema = z.enum(['id','modelId','layer','index','typeName','creatorId','name','pole','aspect','tokens','values','metadata','createdAt','updatedAt']);
 
 export const ExplanationScoreScalarFieldEnumSchema = z.enum(['id','initiatedByUserId','value','explanationId','explanationScoreTypeName','explanationScoreModelName','jsonDetails','createdAt']);
 
@@ -132,7 +144,7 @@ export const SavedSearchActivationScalarFieldEnumSchema = z.enum(['savedSearchId
 
 export const SteerOutputToNeuronScalarFieldEnumSchema = z.enum(['modelId','layer','index','strength','steerOutputId']);
 
-export const SteerOutputScalarFieldEnumSchema = z.enum(['id','type','modelId','steerSpecialTokens','inputText','inputTextMd5','inputTextChatTemplate','inputTextChatTemplateMd5','outputText','outputTextChatTemplate','temperature','numTokens','freqPenalty','seed','strengthMultiplier','steerMethod','createdAt','creatorId','version','logprobs','connectedDefaultOutputId','connectedSteerOutputIds','capMonitorOutput']);
+export const SteerOutputScalarFieldEnumSchema = z.enum(['id','type','modelId','steerSpecialTokens','inputText','inputTextMd5','inputTextChatTemplate','inputTextChatTemplateMd5','outputText','outputTextChatTemplate','temperature','numTokens','freqPenalty','presencePenalty','seed','strengthMultiplier','steerMethod','createdAt','creatorId','version','logprobs','connectedDefaultOutputId','connectedSteerOutputIds','capMonitorOutput']);
 
 export const ProblemNodeScalarFieldEnumSchema = z.enum(['id','nodeTypes','parentId','title','description','author','mainUrl','additionalUrls','applicationTags','approvalState','approverId','createdById','createdAt','updatedAt']);
 
@@ -142,7 +154,7 @@ export const ProblemNodeCommentScalarFieldEnumSchema = z.enum(['id','problemNode
 
 export const ProblemNodeLogScalarFieldEnumSchema = z.enum(['id','timestamp','userId','problemNodeId','action','details']);
 
-export const NlaSourceScalarFieldEnumSchema = z.enum(['id','modelId','displayName','description','url','author','av','ar','layerNum','servers','norm','createdAt']);
+export const NlaSourceScalarFieldEnumSchema = z.enum(['id','modelId','displayName','description','url','author','av','ar','layerNum','norm','createdAt']);
 
 export const NlaExplainCacheScalarFieldEnumSchema = z.enum(['id','text','textHash','numCompletionTokens','temperature','modelId','nlaSourceId','sortedPositions','tokens','resultJson','createdAt']);
 
@@ -160,25 +172,43 @@ export const ProbeLogScalarFieldEnumSchema = z.enum(['id','action','modelId','us
 
 export const ProcessLockScalarFieldEnumSchema = z.enum(['name','startedAt','expiresAt','details']);
 
+export const VectorTagScalarFieldEnumSchema = z.enum(['name','displayName','description','creatorId','createdAt']);
+
+export const VectorTagOnVectorScalarFieldEnumSchema = z.enum(['vectorId','tagName','addedAt']);
+
+export const VectorScalarFieldEnumSchema = z.enum(['id','modelId','name','author','layers','polePositive','poleNegative','polePositiveDescription','poleNegativeDescription','displayName','caveat','values','projectionParams','hfRepoId','hfFolderId','visibility','creatorId','createdAt']);
+
 export const SortOrderSchema = z.enum(['asc','desc']);
 
-export const JsonNullValueInputSchema = z.enum(['JsonNull',]);
+export const JsonNullValueInputSchema: z.ZodType<Prisma.JsonNullValueInput> = z.enum(['JsonNull',]).transform((value) => (value === 'JsonNull' ? Prisma.JsonNull : value));
 
-export const NullableJsonNullValueInputSchema = z.enum(['DbNull','JsonNull',]).transform((v) => transformJsonNull(v));
+export const NullableJsonNullValueInputSchema: z.ZodType<Prisma.NullableJsonNullValueInput> = z.enum(['DbNull','JsonNull',]).transform((value) => value === 'JsonNull' ? Prisma.JsonNull : value === 'DbNull' ? Prisma.DbNull : value);
 
 export const QueryModeSchema = z.enum(['default','insensitive']);
 
 export const NullsOrderSchema = z.enum(['first','last']);
 
-export const JsonNullValueFilterSchema = z.enum(['DbNull','JsonNull','AnyNull',]);
+export const JsonNullValueFilterSchema: z.ZodType<Prisma.JsonNullValueFilter> = z.enum(['DbNull','JsonNull','AnyNull',]).transform((value) => value === 'JsonNull' ? Prisma.JsonNull : value === 'DbNull' ? Prisma.DbNull : value === 'AnyNull' ? Prisma.AnyNull : value);
+
+export const EmailSuppressionReasonSchema = z.enum(['BOUNCE','COMPLAINT']);
+
+export type EmailSuppressionReasonType = `${z.infer<typeof EmailSuppressionReasonSchema>}`
 
 export const UserSecretTypeSchema = z.enum(['NEURONPEDIA','OPENAI','GOOGLE','ANTHROPIC','OPENROUTER']);
 
 export type UserSecretTypeType = `${z.infer<typeof UserSecretTypeSchema>}`
 
-export const InferenceEngineSchema = z.enum(['TRANSFORMER_LENS','NNSIGHT','CSPACE']);
+export const ComputeServiceSchema = z.enum(['INFERENCE','GRAPH','NLA','AUTOINTERP','SPARSITY']);
 
-export type InferenceEngineType = `${z.infer<typeof InferenceEngineSchema>}`
+export type ComputeServiceType = `${z.infer<typeof ComputeServiceSchema>}`
+
+export const ExplanationPoleSchema = z.enum(['POSITIVE','NEGATIVE','BOTH']);
+
+export type ExplanationPoleType = `${z.infer<typeof ExplanationPoleSchema>}`
+
+export const ExplanationAspectSchema = z.enum(['ACTIVATION','STEERING']);
+
+export type ExplanationAspectType = `${z.infer<typeof ExplanationAspectSchema>}`
 
 export const SteerOutputTypeSchema = z.enum(['DEFAULT','STEERED']);
 
@@ -229,7 +259,7 @@ export type ProbeLogActionType = `${z.infer<typeof ProbeLogActionSchema>}`
 /////////////////////////////////////////
 
 export const AccountSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   userId: z.string(),
   type: z.string(),
   provider: z.string(),
@@ -290,7 +320,7 @@ export const AccountWithPartialRelationsSchema: z.ZodType<AccountWithPartialRela
 /////////////////////////////////////////
 
 export const SessionSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   sessionToken: z.string(),
   userId: z.string(),
   expires: z.coerce.date(),
@@ -344,7 +374,7 @@ export const SessionWithPartialRelationsSchema: z.ZodType<SessionWithPartialRela
 
 export const UserSecretSchema = z.object({
   type: UserSecretTypeSchema,
-  id: z.string().cuid(),
+  id: z.cuid(),
   username: z.string(),
   value: z.string(),
   createdAt: z.coerce.date(),
@@ -398,7 +428,8 @@ export const UserSecretWithPartialRelationsSchema: z.ZodType<UserSecretWithParti
 /////////////////////////////////////////
 
 export const UserSchema = z.object({
-  id: z.string().cuid(),
+  emailSuppressedReason: EmailSuppressionReasonSchema.nullable(),
+  id: z.cuid(),
   name: z.string().regex(new RegExp(/^[a-zA-Z0-9-.]+$/), "Name should contain only numbers, letters, dashes, and periods.",).min(1).max(39).transform((val) => val.toLowerCase()),
   bio: z.string().nullable(),
   email: z.string().nullable(),
@@ -408,10 +439,12 @@ export const UserSchema = z.object({
   image: z.string().nullable(),
   admin: z.boolean(),
   canTriggerExplanations: z.boolean(),
+  canUploadExplanations: z.boolean(),
   isProblemEditor: z.boolean(),
   emailNewsletterNotification: z.boolean(),
   emailUnsubscribeAll: z.boolean(),
-  emailUnsubscribeCode: z.string().cuid(),
+  emailUnsubscribeCode: z.cuid(),
+  emailSuppressedAt: z.coerce.date().nullable(),
   createdAt: z.coerce.date(),
 })
 
@@ -432,6 +465,7 @@ export type UserRelations = {
   secrets: UserSecretWithRelations[];
   accounts: AccountWithRelations[];
   explanations: ExplanationWithRelations[];
+  tokenLists: NeuronTokenListWithRelations[];
   triggeredExplanations: ExplanationWithRelations[];
   neurons: NeuronWithRelations[];
   sources: SourceWithRelations[];
@@ -455,8 +489,12 @@ export type UserRelations = {
   graphMetadatas: GraphMetadataWithRelations[];
   graphMetadataDataPutRequests: GraphMetadataDataPutRequestWithRelations[];
   graphMetadataSubgraphs: GraphMetadataSubgraphWithRelations[];
+  jlensShares: JlensShareWithRelations[];
+  jlensSharePutRequests: JlensSharePutRequestWithRelations[];
   samples: SampleWithRelations[];
   probes: ProbeWithRelations[];
+  vectors: VectorWithRelations[];
+  vectorTags: VectorTagWithRelations[];
   problemNodesCreated: ProblemNodeWithRelations[];
   problemNodesApproved: ProblemNodeWithRelations[];
   problemEdgesCreated: ProblemEdgeWithRelations[];
@@ -471,6 +509,7 @@ export const UserWithRelationsSchema: z.ZodType<UserWithRelations> = UserSchema.
   secrets: z.lazy(() => UserSecretWithRelationsSchema).array(),
   accounts: z.lazy(() => AccountWithRelationsSchema).array(),
   explanations: z.lazy(() => ExplanationWithRelationsSchema).array(),
+  tokenLists: z.lazy(() => NeuronTokenListWithRelationsSchema).array(),
   triggeredExplanations: z.lazy(() => ExplanationWithRelationsSchema).array(),
   neurons: z.lazy(() => NeuronWithRelationsSchema).array(),
   sources: z.lazy(() => SourceWithRelationsSchema).array(),
@@ -494,8 +533,12 @@ export const UserWithRelationsSchema: z.ZodType<UserWithRelations> = UserSchema.
   graphMetadatas: z.lazy(() => GraphMetadataWithRelationsSchema).array(),
   graphMetadataDataPutRequests: z.lazy(() => GraphMetadataDataPutRequestWithRelationsSchema).array(),
   graphMetadataSubgraphs: z.lazy(() => GraphMetadataSubgraphWithRelationsSchema).array(),
+  jlensShares: z.lazy(() => JlensShareWithRelationsSchema).array(),
+  jlensSharePutRequests: z.lazy(() => JlensSharePutRequestWithRelationsSchema).array(),
   samples: z.lazy(() => SampleWithRelationsSchema).array(),
   probes: z.lazy(() => ProbeWithRelationsSchema).array(),
+  vectors: z.lazy(() => VectorWithRelationsSchema).array(),
+  vectorTags: z.lazy(() => VectorTagWithRelationsSchema).array(),
   problemNodesCreated: z.lazy(() => ProblemNodeWithRelationsSchema).array(),
   problemNodesApproved: z.lazy(() => ProblemNodeWithRelationsSchema).array(),
   problemEdgesCreated: z.lazy(() => ProblemEdgeWithRelationsSchema).array(),
@@ -511,6 +554,7 @@ export type UserPartialRelations = {
   secrets?: UserSecretPartialWithRelations[];
   accounts?: AccountPartialWithRelations[];
   explanations?: ExplanationPartialWithRelations[];
+  tokenLists?: NeuronTokenListPartialWithRelations[];
   triggeredExplanations?: ExplanationPartialWithRelations[];
   neurons?: NeuronPartialWithRelations[];
   sources?: SourcePartialWithRelations[];
@@ -534,8 +578,12 @@ export type UserPartialRelations = {
   graphMetadatas?: GraphMetadataPartialWithRelations[];
   graphMetadataDataPutRequests?: GraphMetadataDataPutRequestPartialWithRelations[];
   graphMetadataSubgraphs?: GraphMetadataSubgraphPartialWithRelations[];
+  jlensShares?: JlensSharePartialWithRelations[];
+  jlensSharePutRequests?: JlensSharePutRequestPartialWithRelations[];
   samples?: SamplePartialWithRelations[];
   probes?: ProbePartialWithRelations[];
+  vectors?: VectorPartialWithRelations[];
+  vectorTags?: VectorTagPartialWithRelations[];
   problemNodesCreated?: ProblemNodePartialWithRelations[];
   problemNodesApproved?: ProblemNodePartialWithRelations[];
   problemEdgesCreated?: ProblemEdgePartialWithRelations[];
@@ -550,6 +598,7 @@ export const UserPartialWithRelationsSchema: z.ZodType<UserPartialWithRelations>
   secrets: z.lazy(() => UserSecretPartialWithRelationsSchema).array(),
   accounts: z.lazy(() => AccountPartialWithRelationsSchema).array(),
   explanations: z.lazy(() => ExplanationPartialWithRelationsSchema).array(),
+  tokenLists: z.lazy(() => NeuronTokenListPartialWithRelationsSchema).array(),
   triggeredExplanations: z.lazy(() => ExplanationPartialWithRelationsSchema).array(),
   neurons: z.lazy(() => NeuronPartialWithRelationsSchema).array(),
   sources: z.lazy(() => SourcePartialWithRelationsSchema).array(),
@@ -573,8 +622,12 @@ export const UserPartialWithRelationsSchema: z.ZodType<UserPartialWithRelations>
   graphMetadatas: z.lazy(() => GraphMetadataPartialWithRelationsSchema).array(),
   graphMetadataDataPutRequests: z.lazy(() => GraphMetadataDataPutRequestPartialWithRelationsSchema).array(),
   graphMetadataSubgraphs: z.lazy(() => GraphMetadataSubgraphPartialWithRelationsSchema).array(),
+  jlensShares: z.lazy(() => JlensSharePartialWithRelationsSchema).array(),
+  jlensSharePutRequests: z.lazy(() => JlensSharePutRequestPartialWithRelationsSchema).array(),
   samples: z.lazy(() => SamplePartialWithRelationsSchema).array(),
   probes: z.lazy(() => ProbePartialWithRelationsSchema).array(),
+  vectors: z.lazy(() => VectorPartialWithRelationsSchema).array(),
+  vectorTags: z.lazy(() => VectorTagPartialWithRelationsSchema).array(),
   problemNodesCreated: z.lazy(() => ProblemNodePartialWithRelationsSchema).array(),
   problemNodesApproved: z.lazy(() => ProblemNodePartialWithRelationsSchema).array(),
   problemEdgesCreated: z.lazy(() => ProblemEdgePartialWithRelationsSchema).array(),
@@ -589,6 +642,7 @@ export const UserWithPartialRelationsSchema: z.ZodType<UserWithPartialRelations>
   secrets: z.lazy(() => UserSecretPartialWithRelationsSchema).array(),
   accounts: z.lazy(() => AccountPartialWithRelationsSchema).array(),
   explanations: z.lazy(() => ExplanationPartialWithRelationsSchema).array(),
+  tokenLists: z.lazy(() => NeuronTokenListPartialWithRelationsSchema).array(),
   triggeredExplanations: z.lazy(() => ExplanationPartialWithRelationsSchema).array(),
   neurons: z.lazy(() => NeuronPartialWithRelationsSchema).array(),
   sources: z.lazy(() => SourcePartialWithRelationsSchema).array(),
@@ -612,8 +666,12 @@ export const UserWithPartialRelationsSchema: z.ZodType<UserWithPartialRelations>
   graphMetadatas: z.lazy(() => GraphMetadataPartialWithRelationsSchema).array(),
   graphMetadataDataPutRequests: z.lazy(() => GraphMetadataDataPutRequestPartialWithRelationsSchema).array(),
   graphMetadataSubgraphs: z.lazy(() => GraphMetadataSubgraphPartialWithRelationsSchema).array(),
+  jlensShares: z.lazy(() => JlensSharePartialWithRelationsSchema).array(),
+  jlensSharePutRequests: z.lazy(() => JlensSharePutRequestPartialWithRelationsSchema).array(),
   samples: z.lazy(() => SamplePartialWithRelationsSchema).array(),
   probes: z.lazy(() => ProbePartialWithRelationsSchema).array(),
+  vectors: z.lazy(() => VectorPartialWithRelationsSchema).array(),
+  vectorTags: z.lazy(() => VectorTagPartialWithRelationsSchema).array(),
   problemNodesCreated: z.lazy(() => ProblemNodePartialWithRelationsSchema).array(),
   problemNodesApproved: z.lazy(() => ProblemNodePartialWithRelationsSchema).array(),
   problemEdgesCreated: z.lazy(() => ProblemEdgePartialWithRelationsSchema).array(),
@@ -627,12 +685,12 @@ export const UserWithPartialRelationsSchema: z.ZodType<UserWithPartialRelations>
 /////////////////////////////////////////
 
 export const GraphMetadataSubgraphSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   displayName: z.string().nullable(),
   graphMetadataId: z.string(),
   pinnedIds: z.string().array(),
-  supernodes: InputJsonValue,
-  clerps: InputJsonValue,
+  supernodes: JsonValueSchema,
+  clerps: JsonValueSchema,
   pruningThreshold: z.number().nullable(),
   densityThreshold: z.number().nullable(),
   userId: z.string(),
@@ -693,7 +751,7 @@ export const GraphMetadataSubgraphWithPartialRelationsSchema: z.ZodType<GraphMet
 /////////////////////////////////////////
 
 export const GraphMetadataSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   modelId: z.string(),
   sourceSetName: z.string().nullable(),
   slug: z.string(),
@@ -769,7 +827,7 @@ export const GraphMetadataWithPartialRelationsSchema: z.ZodType<GraphMetadataWit
 /////////////////////////////////////////
 
 export const GraphMetadataDataPutRequestSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   ipAddress: z.string(),
   filename: z.string(),
   url: z.string(),
@@ -820,11 +878,145 @@ export const GraphMetadataDataPutRequestWithPartialRelationsSchema: z.ZodType<Gr
 }).partial())
 
 /////////////////////////////////////////
+// JLENS SHARE SCHEMA
+/////////////////////////////////////////
+
+export const JlensShareSchema = z.object({
+  id: z.cuid(),
+  kind: z.string(),
+  modelId: z.string(),
+  url: z.string(),
+  description: z.string().nullable(),
+  lockedTokens: JsonValueSchema,
+  selectedPositions: z.number().int().array(),
+  lensColumns: z.string().array(),
+  activeLensModeTab: z.string(),
+  topN: z.number().int(),
+  hideNonWordTokens: z.boolean(),
+  temperature: z.number(),
+  numCompletionTokens: z.number().int(),
+  steerToken: z.string().nullable(),
+  steerType: z.string().nullable(),
+  steerLayers: z.number().int().array(),
+  steerStrength: z.number().nullable(),
+  steerAblate: z.boolean().nullable(),
+  steerMode: z.string().nullable(),
+  swapToken: z.string().nullable(),
+  steerGenerated: z.boolean().nullable(),
+  numPromptTokens: z.number().int().nullable(),
+  userId: z.string().nullable(),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
+})
+
+export type JlensShare = z.infer<typeof JlensShareSchema>
+
+/////////////////////////////////////////
+// JLENS SHARE PARTIAL SCHEMA
+/////////////////////////////////////////
+
+export const JlensSharePartialSchema = JlensShareSchema.partial()
+
+export type JlensSharePartial = z.infer<typeof JlensSharePartialSchema>
+
+// JLENS SHARE RELATION SCHEMA
+//------------------------------------------------------
+
+export type JlensShareRelations = {
+  model: ModelWithRelations;
+  user?: UserWithRelations | null;
+};
+
+export type JlensShareWithRelations = z.infer<typeof JlensShareSchema> & JlensShareRelations
+
+export const JlensShareWithRelationsSchema: z.ZodType<JlensShareWithRelations> = JlensShareSchema.merge(z.object({
+  model: z.lazy(() => ModelWithRelationsSchema),
+  user: z.lazy(() => UserWithRelationsSchema).nullable(),
+}))
+
+// JLENS SHARE PARTIAL RELATION SCHEMA
+//------------------------------------------------------
+
+export type JlensSharePartialRelations = {
+  model?: ModelPartialWithRelations;
+  user?: UserPartialWithRelations | null;
+};
+
+export type JlensSharePartialWithRelations = z.infer<typeof JlensSharePartialSchema> & JlensSharePartialRelations
+
+export const JlensSharePartialWithRelationsSchema: z.ZodType<JlensSharePartialWithRelations> = JlensSharePartialSchema.merge(z.object({
+  model: z.lazy(() => ModelPartialWithRelationsSchema),
+  user: z.lazy(() => UserPartialWithRelationsSchema).nullable(),
+})).partial()
+
+export type JlensShareWithPartialRelations = z.infer<typeof JlensShareSchema> & JlensSharePartialRelations
+
+export const JlensShareWithPartialRelationsSchema: z.ZodType<JlensShareWithPartialRelations> = JlensShareSchema.merge(z.object({
+  model: z.lazy(() => ModelPartialWithRelationsSchema),
+  user: z.lazy(() => UserPartialWithRelationsSchema).nullable(),
+}).partial())
+
+/////////////////////////////////////////
+// JLENS SHARE PUT REQUEST SCHEMA
+/////////////////////////////////////////
+
+export const JlensSharePutRequestSchema = z.object({
+  id: z.cuid(),
+  ipAddress: z.string(),
+  filename: z.string(),
+  url: z.string(),
+  userId: z.string().nullable(),
+  createdAt: z.coerce.date(),
+})
+
+export type JlensSharePutRequest = z.infer<typeof JlensSharePutRequestSchema>
+
+/////////////////////////////////////////
+// JLENS SHARE PUT REQUEST PARTIAL SCHEMA
+/////////////////////////////////////////
+
+export const JlensSharePutRequestPartialSchema = JlensSharePutRequestSchema.partial()
+
+export type JlensSharePutRequestPartial = z.infer<typeof JlensSharePutRequestPartialSchema>
+
+// JLENS SHARE PUT REQUEST RELATION SCHEMA
+//------------------------------------------------------
+
+export type JlensSharePutRequestRelations = {
+  user?: UserWithRelations | null;
+};
+
+export type JlensSharePutRequestWithRelations = z.infer<typeof JlensSharePutRequestSchema> & JlensSharePutRequestRelations
+
+export const JlensSharePutRequestWithRelationsSchema: z.ZodType<JlensSharePutRequestWithRelations> = JlensSharePutRequestSchema.merge(z.object({
+  user: z.lazy(() => UserWithRelationsSchema).nullable(),
+}))
+
+// JLENS SHARE PUT REQUEST PARTIAL RELATION SCHEMA
+//------------------------------------------------------
+
+export type JlensSharePutRequestPartialRelations = {
+  user?: UserPartialWithRelations | null;
+};
+
+export type JlensSharePutRequestPartialWithRelations = z.infer<typeof JlensSharePutRequestPartialSchema> & JlensSharePutRequestPartialRelations
+
+export const JlensSharePutRequestPartialWithRelationsSchema: z.ZodType<JlensSharePutRequestPartialWithRelations> = JlensSharePutRequestPartialSchema.merge(z.object({
+  user: z.lazy(() => UserPartialWithRelationsSchema).nullable(),
+})).partial()
+
+export type JlensSharePutRequestWithPartialRelations = z.infer<typeof JlensSharePutRequestSchema> & JlensSharePutRequestPartialRelations
+
+export const JlensSharePutRequestWithPartialRelationsSchema: z.ZodType<JlensSharePutRequestWithPartialRelations> = JlensSharePutRequestSchema.merge(z.object({
+  user: z.lazy(() => UserPartialWithRelationsSchema).nullable(),
+}).partial())
+
+/////////////////////////////////////////
 // LIST COMMENT SCHEMA
 /////////////////////////////////////////
 
 export const ListCommentSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   listId: z.string(),
   text: z.string(),
   userId: z.string(),
@@ -883,7 +1075,7 @@ export const ListCommentWithPartialRelationsSchema: z.ZodType<ListCommentWithPar
 /////////////////////////////////////////
 
 export const ListSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   name: z.string(),
   description: z.string(),
   defaultTestText: z.string().nullable(),
@@ -1092,6 +1284,27 @@ export const VerificationTokenPartialSchema = VerificationTokenSchema.partial()
 export type VerificationTokenPartial = z.infer<typeof VerificationTokenPartialSchema>
 
 /////////////////////////////////////////
+// SIGN IN EMAIL LOG SCHEMA
+/////////////////////////////////////////
+
+export const SignInEmailLogSchema = z.object({
+  id: z.cuid(),
+  to: z.string(),
+  toKey: z.string(),
+  sentAt: z.coerce.date(),
+})
+
+export type SignInEmailLog = z.infer<typeof SignInEmailLogSchema>
+
+/////////////////////////////////////////
+// SIGN IN EMAIL LOG PARTIAL SCHEMA
+/////////////////////////////////////////
+
+export const SignInEmailLogPartialSchema = SignInEmailLogSchema.partial()
+
+export type SignInEmailLogPartial = z.infer<typeof SignInEmailLogPartialSchema>
+
+/////////////////////////////////////////
 // MODEL SCHEMA
 /////////////////////////////////////////
 
@@ -1103,6 +1316,7 @@ export const ModelSchema = z.object({
   creatorId: z.string(),
   tlensId: z.string().nullable(),
   openRouterId: z.string().nullable(),
+  hfRepoId: z.string().nullable(),
   dimension: z.number().int().nullable(),
   thinking: z.boolean(),
   defaultSourceSetName: z.string().nullable(),
@@ -1115,7 +1329,7 @@ export const ModelSchema = z.object({
   createdAt: z.coerce.date(),
   owner: z.string().trim().min(1),
   updatedAt: z.coerce.date(),
-  website: z.string().url().nullable(),
+  website: z.url().nullable(),
 })
 
 export type Model = z.infer<typeof ModelSchema>
@@ -1142,15 +1356,16 @@ export type ModelRelations = {
   sourceSets: SourceSetWithRelations[];
   steerOutputs: SteerOutputWithRelations[];
   evals: EvalWithRelations[];
-  sourceInferenceHosts: InferenceHostSourceWithRelations[];
-  graphHostSources: GraphHostSourceWithRelations[];
+  computeHosts: ComputeHostWithRelations[];
   graphMetadata: GraphMetadataWithRelations[];
+  jlensShares: JlensShareWithRelations[];
   nlaSources: NlaSourceWithRelations[];
   nlaExplainCaches: NlaExplainCacheWithRelations[];
   headMetrics: ModelHeadMetricsWithRelations[];
   headSequences: ModelHeadSequenceWithRelations[];
   samples: SampleWithRelations[];
   probes: ProbeWithRelations[];
+  vectors: VectorWithRelations[];
 };
 
 export type ModelWithRelations = z.infer<typeof ModelSchema> & ModelRelations
@@ -1166,15 +1381,16 @@ export const ModelWithRelationsSchema: z.ZodType<ModelWithRelations> = ModelSche
   sourceSets: z.lazy(() => SourceSetWithRelationsSchema).array(),
   steerOutputs: z.lazy(() => SteerOutputWithRelationsSchema).array(),
   evals: z.lazy(() => EvalWithRelationsSchema).array(),
-  sourceInferenceHosts: z.lazy(() => InferenceHostSourceWithRelationsSchema).array(),
-  graphHostSources: z.lazy(() => GraphHostSourceWithRelationsSchema).array(),
+  computeHosts: z.lazy(() => ComputeHostWithRelationsSchema).array(),
   graphMetadata: z.lazy(() => GraphMetadataWithRelationsSchema).array(),
+  jlensShares: z.lazy(() => JlensShareWithRelationsSchema).array(),
   nlaSources: z.lazy(() => NlaSourceWithRelationsSchema).array(),
   nlaExplainCaches: z.lazy(() => NlaExplainCacheWithRelationsSchema).array(),
   headMetrics: z.lazy(() => ModelHeadMetricsWithRelationsSchema).array(),
   headSequences: z.lazy(() => ModelHeadSequenceWithRelationsSchema).array(),
   samples: z.lazy(() => SampleWithRelationsSchema).array(),
   probes: z.lazy(() => ProbeWithRelationsSchema).array(),
+  vectors: z.lazy(() => VectorWithRelationsSchema).array(),
 }))
 
 // MODEL PARTIAL RELATION SCHEMA
@@ -1191,15 +1407,16 @@ export type ModelPartialRelations = {
   sourceSets?: SourceSetPartialWithRelations[];
   steerOutputs?: SteerOutputPartialWithRelations[];
   evals?: EvalPartialWithRelations[];
-  sourceInferenceHosts?: InferenceHostSourcePartialWithRelations[];
-  graphHostSources?: GraphHostSourcePartialWithRelations[];
+  computeHosts?: ComputeHostPartialWithRelations[];
   graphMetadata?: GraphMetadataPartialWithRelations[];
+  jlensShares?: JlensSharePartialWithRelations[];
   nlaSources?: NlaSourcePartialWithRelations[];
   nlaExplainCaches?: NlaExplainCachePartialWithRelations[];
   headMetrics?: ModelHeadMetricsPartialWithRelations[];
   headSequences?: ModelHeadSequencePartialWithRelations[];
   samples?: SamplePartialWithRelations[];
   probes?: ProbePartialWithRelations[];
+  vectors?: VectorPartialWithRelations[];
 };
 
 export type ModelPartialWithRelations = z.infer<typeof ModelPartialSchema> & ModelPartialRelations
@@ -1215,15 +1432,16 @@ export const ModelPartialWithRelationsSchema: z.ZodType<ModelPartialWithRelation
   sourceSets: z.lazy(() => SourceSetPartialWithRelationsSchema).array(),
   steerOutputs: z.lazy(() => SteerOutputPartialWithRelationsSchema).array(),
   evals: z.lazy(() => EvalPartialWithRelationsSchema).array(),
-  sourceInferenceHosts: z.lazy(() => InferenceHostSourcePartialWithRelationsSchema).array(),
-  graphHostSources: z.lazy(() => GraphHostSourcePartialWithRelationsSchema).array(),
+  computeHosts: z.lazy(() => ComputeHostPartialWithRelationsSchema).array(),
   graphMetadata: z.lazy(() => GraphMetadataPartialWithRelationsSchema).array(),
+  jlensShares: z.lazy(() => JlensSharePartialWithRelationsSchema).array(),
   nlaSources: z.lazy(() => NlaSourcePartialWithRelationsSchema).array(),
   nlaExplainCaches: z.lazy(() => NlaExplainCachePartialWithRelationsSchema).array(),
   headMetrics: z.lazy(() => ModelHeadMetricsPartialWithRelationsSchema).array(),
   headSequences: z.lazy(() => ModelHeadSequencePartialWithRelationsSchema).array(),
   samples: z.lazy(() => SamplePartialWithRelationsSchema).array(),
   probes: z.lazy(() => ProbePartialWithRelationsSchema).array(),
+  vectors: z.lazy(() => VectorPartialWithRelationsSchema).array(),
 })).partial()
 
 export type ModelWithPartialRelations = z.infer<typeof ModelSchema> & ModelPartialRelations
@@ -1239,15 +1457,16 @@ export const ModelWithPartialRelationsSchema: z.ZodType<ModelWithPartialRelation
   sourceSets: z.lazy(() => SourceSetPartialWithRelationsSchema).array(),
   steerOutputs: z.lazy(() => SteerOutputPartialWithRelationsSchema).array(),
   evals: z.lazy(() => EvalPartialWithRelationsSchema).array(),
-  sourceInferenceHosts: z.lazy(() => InferenceHostSourcePartialWithRelationsSchema).array(),
-  graphHostSources: z.lazy(() => GraphHostSourcePartialWithRelationsSchema).array(),
+  computeHosts: z.lazy(() => ComputeHostPartialWithRelationsSchema).array(),
   graphMetadata: z.lazy(() => GraphMetadataPartialWithRelationsSchema).array(),
+  jlensShares: z.lazy(() => JlensSharePartialWithRelationsSchema).array(),
   nlaSources: z.lazy(() => NlaSourcePartialWithRelationsSchema).array(),
   nlaExplainCaches: z.lazy(() => NlaExplainCachePartialWithRelationsSchema).array(),
   headMetrics: z.lazy(() => ModelHeadMetricsPartialWithRelationsSchema).array(),
   headSequences: z.lazy(() => ModelHeadSequencePartialWithRelationsSchema).array(),
   samples: z.lazy(() => SamplePartialWithRelationsSchema).array(),
   probes: z.lazy(() => ProbePartialWithRelationsSchema).array(),
+  vectors: z.lazy(() => VectorPartialWithRelationsSchema).array(),
 }).partial())
 
 /////////////////////////////////////////
@@ -1255,7 +1474,7 @@ export const ModelWithPartialRelationsSchema: z.ZodType<ModelWithPartialRelation
 /////////////////////////////////////////
 
 export const ModelHeadMetricsSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   modelId: z.string(),
   layer: z.number().int(),
   headIndex: z.number().int(),
@@ -1271,11 +1490,11 @@ export const ModelHeadMetricsSchema = z.object({
   qkDistance: z.number().nullable(),
   qkDistanceVariance: z.number().nullable(),
   inductionScore: z.number().nullable(),
-  qkDistanceHistogram: NullableJsonValue.optional(),
-  topQueryTokens: NullableJsonValue.optional(),
-  topKeyTokens: NullableJsonValue.optional(),
-  activationHistogram: NullableJsonValue.optional(),
-  headStatistics: NullableJsonValue.optional(),
+  qkDistanceHistogram: JsonValueSchema.nullable(),
+  topQueryTokens: JsonValueSchema.nullable(),
+  topKeyTokens: JsonValueSchema.nullable(),
+  activationHistogram: JsonValueSchema.nullable(),
+  headStatistics: JsonValueSchema.nullable(),
   createdAt: z.coerce.date(),
   updatedAt: z.coerce.date(),
 })
@@ -1298,11 +1517,11 @@ export type ModelHeadMetricsRelations = {
 };
 
 export type ModelHeadMetricsWithRelations = Omit<z.infer<typeof ModelHeadMetricsSchema>, "qkDistanceHistogram" | "topQueryTokens" | "topKeyTokens" | "activationHistogram" | "headStatistics"> & {
-  qkDistanceHistogram?: NullableJsonInput;
-  topQueryTokens?: NullableJsonInput;
-  topKeyTokens?: NullableJsonInput;
-  activationHistogram?: NullableJsonInput;
-  headStatistics?: NullableJsonInput;
+  qkDistanceHistogram?: JsonValueType | null;
+  topQueryTokens?: JsonValueType | null;
+  topKeyTokens?: JsonValueType | null;
+  activationHistogram?: JsonValueType | null;
+  headStatistics?: JsonValueType | null;
 } & ModelHeadMetricsRelations
 
 export const ModelHeadMetricsWithRelationsSchema: z.ZodType<ModelHeadMetricsWithRelations> = ModelHeadMetricsSchema.merge(z.object({
@@ -1317,11 +1536,11 @@ export type ModelHeadMetricsPartialRelations = {
 };
 
 export type ModelHeadMetricsPartialWithRelations = Omit<z.infer<typeof ModelHeadMetricsPartialSchema>, "qkDistanceHistogram" | "topQueryTokens" | "topKeyTokens" | "activationHistogram" | "headStatistics"> & {
-  qkDistanceHistogram?: NullableJsonInput;
-  topQueryTokens?: NullableJsonInput;
-  topKeyTokens?: NullableJsonInput;
-  activationHistogram?: NullableJsonInput;
-  headStatistics?: NullableJsonInput;
+  qkDistanceHistogram?: JsonValueType | null;
+  topQueryTokens?: JsonValueType | null;
+  topKeyTokens?: JsonValueType | null;
+  activationHistogram?: JsonValueType | null;
+  headStatistics?: JsonValueType | null;
 } & ModelHeadMetricsPartialRelations
 
 export const ModelHeadMetricsPartialWithRelationsSchema: z.ZodType<ModelHeadMetricsPartialWithRelations> = ModelHeadMetricsPartialSchema.merge(z.object({
@@ -1329,11 +1548,11 @@ export const ModelHeadMetricsPartialWithRelationsSchema: z.ZodType<ModelHeadMetr
 })).partial()
 
 export type ModelHeadMetricsWithPartialRelations = Omit<z.infer<typeof ModelHeadMetricsSchema>, "qkDistanceHistogram" | "topQueryTokens" | "topKeyTokens" | "activationHistogram" | "headStatistics"> & {
-  qkDistanceHistogram?: NullableJsonInput;
-  topQueryTokens?: NullableJsonInput;
-  topKeyTokens?: NullableJsonInput;
-  activationHistogram?: NullableJsonInput;
-  headStatistics?: NullableJsonInput;
+  qkDistanceHistogram?: JsonValueType | null;
+  topQueryTokens?: JsonValueType | null;
+  topKeyTokens?: JsonValueType | null;
+  activationHistogram?: JsonValueType | null;
+  headStatistics?: JsonValueType | null;
 } & ModelHeadMetricsPartialRelations
 
 export const ModelHeadMetricsWithPartialRelationsSchema: z.ZodType<ModelHeadMetricsWithPartialRelations> = ModelHeadMetricsSchema.merge(z.object({
@@ -1345,7 +1564,7 @@ export const ModelHeadMetricsWithPartialRelationsSchema: z.ZodType<ModelHeadMetr
 /////////////////////////////////////////
 
 export const ModelHeadSequenceSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   modelId: z.string(),
   layer: z.number().int(),
   headIndex: z.number().int(),
@@ -1406,240 +1625,191 @@ export const ModelHeadSequenceWithPartialRelationsSchema: z.ZodType<ModelHeadSeq
 }).partial())
 
 /////////////////////////////////////////
-// GRAPH HOST SOURCE SCHEMA
+// COMPUTE HOST SCHEMA
 /////////////////////////////////////////
 
-export const GraphHostSourceSchema = z.object({
-  id: z.string().cuid(),
-  name: z.string(),
-  hostUrl: z.string().nullable(),
-  runpodServerlessUrl: z.string().nullable(),
-  modelId: z.string(),
-  createdAt: z.coerce.date(),
-  updatedAt: z.coerce.date(),
-})
-
-export type GraphHostSource = z.infer<typeof GraphHostSourceSchema>
-
-/////////////////////////////////////////
-// GRAPH HOST SOURCE PARTIAL SCHEMA
-/////////////////////////////////////////
-
-export const GraphHostSourcePartialSchema = GraphHostSourceSchema.partial()
-
-export type GraphHostSourcePartial = z.infer<typeof GraphHostSourcePartialSchema>
-
-// GRAPH HOST SOURCE RELATION SCHEMA
-//------------------------------------------------------
-
-export type GraphHostSourceRelations = {
-  model: ModelWithRelations;
-  sourceSets: GraphHostSourceOnSourceSetWithRelations[];
-};
-
-export type GraphHostSourceWithRelations = z.infer<typeof GraphHostSourceSchema> & GraphHostSourceRelations
-
-export const GraphHostSourceWithRelationsSchema: z.ZodType<GraphHostSourceWithRelations> = GraphHostSourceSchema.merge(z.object({
-  model: z.lazy(() => ModelWithRelationsSchema),
-  sourceSets: z.lazy(() => GraphHostSourceOnSourceSetWithRelationsSchema).array(),
-}))
-
-// GRAPH HOST SOURCE PARTIAL RELATION SCHEMA
-//------------------------------------------------------
-
-export type GraphHostSourcePartialRelations = {
-  model?: ModelPartialWithRelations;
-  sourceSets?: GraphHostSourceOnSourceSetPartialWithRelations[];
-};
-
-export type GraphHostSourcePartialWithRelations = z.infer<typeof GraphHostSourcePartialSchema> & GraphHostSourcePartialRelations
-
-export const GraphHostSourcePartialWithRelationsSchema: z.ZodType<GraphHostSourcePartialWithRelations> = GraphHostSourcePartialSchema.merge(z.object({
-  model: z.lazy(() => ModelPartialWithRelationsSchema),
-  sourceSets: z.lazy(() => GraphHostSourceOnSourceSetPartialWithRelationsSchema).array(),
-})).partial()
-
-export type GraphHostSourceWithPartialRelations = z.infer<typeof GraphHostSourceSchema> & GraphHostSourcePartialRelations
-
-export const GraphHostSourceWithPartialRelationsSchema: z.ZodType<GraphHostSourceWithPartialRelations> = GraphHostSourceSchema.merge(z.object({
-  model: z.lazy(() => ModelPartialWithRelationsSchema),
-  sourceSets: z.lazy(() => GraphHostSourceOnSourceSetPartialWithRelationsSchema).array(),
-}).partial())
-
-/////////////////////////////////////////
-// GRAPH HOST SOURCE ON SOURCE SET SCHEMA
-/////////////////////////////////////////
-
-export const GraphHostSourceOnSourceSetSchema = z.object({
-  sourceSetName: z.string(),
-  sourceSetModelId: z.string(),
-  graphHostSourceId: z.string(),
-})
-
-export type GraphHostSourceOnSourceSet = z.infer<typeof GraphHostSourceOnSourceSetSchema>
-
-/////////////////////////////////////////
-// GRAPH HOST SOURCE ON SOURCE SET PARTIAL SCHEMA
-/////////////////////////////////////////
-
-export const GraphHostSourceOnSourceSetPartialSchema = GraphHostSourceOnSourceSetSchema.partial()
-
-export type GraphHostSourceOnSourceSetPartial = z.infer<typeof GraphHostSourceOnSourceSetPartialSchema>
-
-// GRAPH HOST SOURCE ON SOURCE SET RELATION SCHEMA
-//------------------------------------------------------
-
-export type GraphHostSourceOnSourceSetRelations = {
-  sourceSet: SourceSetWithRelations;
-  graphHostSource: GraphHostSourceWithRelations;
-};
-
-export type GraphHostSourceOnSourceSetWithRelations = z.infer<typeof GraphHostSourceOnSourceSetSchema> & GraphHostSourceOnSourceSetRelations
-
-export const GraphHostSourceOnSourceSetWithRelationsSchema: z.ZodType<GraphHostSourceOnSourceSetWithRelations> = GraphHostSourceOnSourceSetSchema.merge(z.object({
-  sourceSet: z.lazy(() => SourceSetWithRelationsSchema),
-  graphHostSource: z.lazy(() => GraphHostSourceWithRelationsSchema),
-}))
-
-// GRAPH HOST SOURCE ON SOURCE SET PARTIAL RELATION SCHEMA
-//------------------------------------------------------
-
-export type GraphHostSourceOnSourceSetPartialRelations = {
-  sourceSet?: SourceSetPartialWithRelations;
-  graphHostSource?: GraphHostSourcePartialWithRelations;
-};
-
-export type GraphHostSourceOnSourceSetPartialWithRelations = z.infer<typeof GraphHostSourceOnSourceSetPartialSchema> & GraphHostSourceOnSourceSetPartialRelations
-
-export const GraphHostSourceOnSourceSetPartialWithRelationsSchema: z.ZodType<GraphHostSourceOnSourceSetPartialWithRelations> = GraphHostSourceOnSourceSetPartialSchema.merge(z.object({
-  sourceSet: z.lazy(() => SourceSetPartialWithRelationsSchema),
-  graphHostSource: z.lazy(() => GraphHostSourcePartialWithRelationsSchema),
-})).partial()
-
-export type GraphHostSourceOnSourceSetWithPartialRelations = z.infer<typeof GraphHostSourceOnSourceSetSchema> & GraphHostSourceOnSourceSetPartialRelations
-
-export const GraphHostSourceOnSourceSetWithPartialRelationsSchema: z.ZodType<GraphHostSourceOnSourceSetWithPartialRelations> = GraphHostSourceOnSourceSetSchema.merge(z.object({
-  sourceSet: z.lazy(() => SourceSetPartialWithRelationsSchema),
-  graphHostSource: z.lazy(() => GraphHostSourcePartialWithRelationsSchema),
-}).partial())
-
-/////////////////////////////////////////
-// INFERENCE HOST SOURCE SCHEMA
-/////////////////////////////////////////
-
-export const InferenceHostSourceSchema = z.object({
-  engine: InferenceEngineSchema,
-  id: z.string().cuid(),
+export const ComputeHostSchema = z.object({
+  service: ComputeServiceSchema,
+  id: z.cuid(),
   name: z.string(),
   hostUrl: z.string(),
+  provider: z.string().nullable(),
+  providerRef: z.string().nullable(),
   modelId: z.string(),
-  runpodServerlessUrl: z.string().nullable(),
+  nlaSourceId: z.string().nullable(),
   createdAt: z.coerce.date(),
   updatedAt: z.coerce.date(),
 })
 
-export type InferenceHostSource = z.infer<typeof InferenceHostSourceSchema>
+export type ComputeHost = z.infer<typeof ComputeHostSchema>
 
 /////////////////////////////////////////
-// INFERENCE HOST SOURCE PARTIAL SCHEMA
+// COMPUTE HOST PARTIAL SCHEMA
 /////////////////////////////////////////
 
-export const InferenceHostSourcePartialSchema = InferenceHostSourceSchema.partial()
+export const ComputeHostPartialSchema = ComputeHostSchema.partial()
 
-export type InferenceHostSourcePartial = z.infer<typeof InferenceHostSourcePartialSchema>
+export type ComputeHostPartial = z.infer<typeof ComputeHostPartialSchema>
 
-// INFERENCE HOST SOURCE RELATION SCHEMA
+// COMPUTE HOST RELATION SCHEMA
 //------------------------------------------------------
 
-export type InferenceHostSourceRelations = {
+export type ComputeHostRelations = {
   model: ModelWithRelations;
-  sources: InferenceHostSourceOnSourceWithRelations[];
+  sources: ComputeHostOnSourceWithRelations[];
+  sourceSets: ComputeHostOnSourceSetWithRelations[];
+  nlaSource?: NlaSourceWithRelations | null;
 };
 
-export type InferenceHostSourceWithRelations = z.infer<typeof InferenceHostSourceSchema> & InferenceHostSourceRelations
+export type ComputeHostWithRelations = z.infer<typeof ComputeHostSchema> & ComputeHostRelations
 
-export const InferenceHostSourceWithRelationsSchema: z.ZodType<InferenceHostSourceWithRelations> = InferenceHostSourceSchema.merge(z.object({
+export const ComputeHostWithRelationsSchema: z.ZodType<ComputeHostWithRelations> = ComputeHostSchema.merge(z.object({
   model: z.lazy(() => ModelWithRelationsSchema),
-  sources: z.lazy(() => InferenceHostSourceOnSourceWithRelationsSchema).array(),
+  sources: z.lazy(() => ComputeHostOnSourceWithRelationsSchema).array(),
+  sourceSets: z.lazy(() => ComputeHostOnSourceSetWithRelationsSchema).array(),
+  nlaSource: z.lazy(() => NlaSourceWithRelationsSchema).nullable(),
 }))
 
-// INFERENCE HOST SOURCE PARTIAL RELATION SCHEMA
+// COMPUTE HOST PARTIAL RELATION SCHEMA
 //------------------------------------------------------
 
-export type InferenceHostSourcePartialRelations = {
+export type ComputeHostPartialRelations = {
   model?: ModelPartialWithRelations;
-  sources?: InferenceHostSourceOnSourcePartialWithRelations[];
+  sources?: ComputeHostOnSourcePartialWithRelations[];
+  sourceSets?: ComputeHostOnSourceSetPartialWithRelations[];
+  nlaSource?: NlaSourcePartialWithRelations | null;
 };
 
-export type InferenceHostSourcePartialWithRelations = z.infer<typeof InferenceHostSourcePartialSchema> & InferenceHostSourcePartialRelations
+export type ComputeHostPartialWithRelations = z.infer<typeof ComputeHostPartialSchema> & ComputeHostPartialRelations
 
-export const InferenceHostSourcePartialWithRelationsSchema: z.ZodType<InferenceHostSourcePartialWithRelations> = InferenceHostSourcePartialSchema.merge(z.object({
+export const ComputeHostPartialWithRelationsSchema: z.ZodType<ComputeHostPartialWithRelations> = ComputeHostPartialSchema.merge(z.object({
   model: z.lazy(() => ModelPartialWithRelationsSchema),
-  sources: z.lazy(() => InferenceHostSourceOnSourcePartialWithRelationsSchema).array(),
+  sources: z.lazy(() => ComputeHostOnSourcePartialWithRelationsSchema).array(),
+  sourceSets: z.lazy(() => ComputeHostOnSourceSetPartialWithRelationsSchema).array(),
+  nlaSource: z.lazy(() => NlaSourcePartialWithRelationsSchema).nullable(),
 })).partial()
 
-export type InferenceHostSourceWithPartialRelations = z.infer<typeof InferenceHostSourceSchema> & InferenceHostSourcePartialRelations
+export type ComputeHostWithPartialRelations = z.infer<typeof ComputeHostSchema> & ComputeHostPartialRelations
 
-export const InferenceHostSourceWithPartialRelationsSchema: z.ZodType<InferenceHostSourceWithPartialRelations> = InferenceHostSourceSchema.merge(z.object({
+export const ComputeHostWithPartialRelationsSchema: z.ZodType<ComputeHostWithPartialRelations> = ComputeHostSchema.merge(z.object({
   model: z.lazy(() => ModelPartialWithRelationsSchema),
-  sources: z.lazy(() => InferenceHostSourceOnSourcePartialWithRelationsSchema).array(),
+  sources: z.lazy(() => ComputeHostOnSourcePartialWithRelationsSchema).array(),
+  sourceSets: z.lazy(() => ComputeHostOnSourceSetPartialWithRelationsSchema).array(),
+  nlaSource: z.lazy(() => NlaSourcePartialWithRelationsSchema).nullable(),
 }).partial())
 
 /////////////////////////////////////////
-// INFERENCE HOST SOURCE ON SOURCE SCHEMA
+// COMPUTE HOST ON SOURCE SCHEMA
 /////////////////////////////////////////
 
-export const InferenceHostSourceOnSourceSchema = z.object({
+export const ComputeHostOnSourceSchema = z.object({
   sourceId: z.string(),
   sourceModelId: z.string(),
-  inferenceHostId: z.string(),
+  computeHostId: z.string(),
 })
 
-export type InferenceHostSourceOnSource = z.infer<typeof InferenceHostSourceOnSourceSchema>
+export type ComputeHostOnSource = z.infer<typeof ComputeHostOnSourceSchema>
 
 /////////////////////////////////////////
-// INFERENCE HOST SOURCE ON SOURCE PARTIAL SCHEMA
+// COMPUTE HOST ON SOURCE PARTIAL SCHEMA
 /////////////////////////////////////////
 
-export const InferenceHostSourceOnSourcePartialSchema = InferenceHostSourceOnSourceSchema.partial()
+export const ComputeHostOnSourcePartialSchema = ComputeHostOnSourceSchema.partial()
 
-export type InferenceHostSourceOnSourcePartial = z.infer<typeof InferenceHostSourceOnSourcePartialSchema>
+export type ComputeHostOnSourcePartial = z.infer<typeof ComputeHostOnSourcePartialSchema>
 
-// INFERENCE HOST SOURCE ON SOURCE RELATION SCHEMA
+// COMPUTE HOST ON SOURCE RELATION SCHEMA
 //------------------------------------------------------
 
-export type InferenceHostSourceOnSourceRelations = {
+export type ComputeHostOnSourceRelations = {
   source: SourceWithRelations;
-  inferenceHost: InferenceHostSourceWithRelations;
+  computeHost: ComputeHostWithRelations;
 };
 
-export type InferenceHostSourceOnSourceWithRelations = z.infer<typeof InferenceHostSourceOnSourceSchema> & InferenceHostSourceOnSourceRelations
+export type ComputeHostOnSourceWithRelations = z.infer<typeof ComputeHostOnSourceSchema> & ComputeHostOnSourceRelations
 
-export const InferenceHostSourceOnSourceWithRelationsSchema: z.ZodType<InferenceHostSourceOnSourceWithRelations> = InferenceHostSourceOnSourceSchema.merge(z.object({
+export const ComputeHostOnSourceWithRelationsSchema: z.ZodType<ComputeHostOnSourceWithRelations> = ComputeHostOnSourceSchema.merge(z.object({
   source: z.lazy(() => SourceWithRelationsSchema),
-  inferenceHost: z.lazy(() => InferenceHostSourceWithRelationsSchema),
+  computeHost: z.lazy(() => ComputeHostWithRelationsSchema),
 }))
 
-// INFERENCE HOST SOURCE ON SOURCE PARTIAL RELATION SCHEMA
+// COMPUTE HOST ON SOURCE PARTIAL RELATION SCHEMA
 //------------------------------------------------------
 
-export type InferenceHostSourceOnSourcePartialRelations = {
+export type ComputeHostOnSourcePartialRelations = {
   source?: SourcePartialWithRelations;
-  inferenceHost?: InferenceHostSourcePartialWithRelations;
+  computeHost?: ComputeHostPartialWithRelations;
 };
 
-export type InferenceHostSourceOnSourcePartialWithRelations = z.infer<typeof InferenceHostSourceOnSourcePartialSchema> & InferenceHostSourceOnSourcePartialRelations
+export type ComputeHostOnSourcePartialWithRelations = z.infer<typeof ComputeHostOnSourcePartialSchema> & ComputeHostOnSourcePartialRelations
 
-export const InferenceHostSourceOnSourcePartialWithRelationsSchema: z.ZodType<InferenceHostSourceOnSourcePartialWithRelations> = InferenceHostSourceOnSourcePartialSchema.merge(z.object({
+export const ComputeHostOnSourcePartialWithRelationsSchema: z.ZodType<ComputeHostOnSourcePartialWithRelations> = ComputeHostOnSourcePartialSchema.merge(z.object({
   source: z.lazy(() => SourcePartialWithRelationsSchema),
-  inferenceHost: z.lazy(() => InferenceHostSourcePartialWithRelationsSchema),
+  computeHost: z.lazy(() => ComputeHostPartialWithRelationsSchema),
 })).partial()
 
-export type InferenceHostSourceOnSourceWithPartialRelations = z.infer<typeof InferenceHostSourceOnSourceSchema> & InferenceHostSourceOnSourcePartialRelations
+export type ComputeHostOnSourceWithPartialRelations = z.infer<typeof ComputeHostOnSourceSchema> & ComputeHostOnSourcePartialRelations
 
-export const InferenceHostSourceOnSourceWithPartialRelationsSchema: z.ZodType<InferenceHostSourceOnSourceWithPartialRelations> = InferenceHostSourceOnSourceSchema.merge(z.object({
+export const ComputeHostOnSourceWithPartialRelationsSchema: z.ZodType<ComputeHostOnSourceWithPartialRelations> = ComputeHostOnSourceSchema.merge(z.object({
   source: z.lazy(() => SourcePartialWithRelationsSchema),
-  inferenceHost: z.lazy(() => InferenceHostSourcePartialWithRelationsSchema),
+  computeHost: z.lazy(() => ComputeHostPartialWithRelationsSchema),
+}).partial())
+
+/////////////////////////////////////////
+// COMPUTE HOST ON SOURCE SET SCHEMA
+/////////////////////////////////////////
+
+export const ComputeHostOnSourceSetSchema = z.object({
+  sourceSetName: z.string(),
+  sourceSetModelId: z.string(),
+  computeHostId: z.string(),
+})
+
+export type ComputeHostOnSourceSet = z.infer<typeof ComputeHostOnSourceSetSchema>
+
+/////////////////////////////////////////
+// COMPUTE HOST ON SOURCE SET PARTIAL SCHEMA
+/////////////////////////////////////////
+
+export const ComputeHostOnSourceSetPartialSchema = ComputeHostOnSourceSetSchema.partial()
+
+export type ComputeHostOnSourceSetPartial = z.infer<typeof ComputeHostOnSourceSetPartialSchema>
+
+// COMPUTE HOST ON SOURCE SET RELATION SCHEMA
+//------------------------------------------------------
+
+export type ComputeHostOnSourceSetRelations = {
+  sourceSet: SourceSetWithRelations;
+  computeHost: ComputeHostWithRelations;
+};
+
+export type ComputeHostOnSourceSetWithRelations = z.infer<typeof ComputeHostOnSourceSetSchema> & ComputeHostOnSourceSetRelations
+
+export const ComputeHostOnSourceSetWithRelationsSchema: z.ZodType<ComputeHostOnSourceSetWithRelations> = ComputeHostOnSourceSetSchema.merge(z.object({
+  sourceSet: z.lazy(() => SourceSetWithRelationsSchema),
+  computeHost: z.lazy(() => ComputeHostWithRelationsSchema),
+}))
+
+// COMPUTE HOST ON SOURCE SET PARTIAL RELATION SCHEMA
+//------------------------------------------------------
+
+export type ComputeHostOnSourceSetPartialRelations = {
+  sourceSet?: SourceSetPartialWithRelations;
+  computeHost?: ComputeHostPartialWithRelations;
+};
+
+export type ComputeHostOnSourceSetPartialWithRelations = z.infer<typeof ComputeHostOnSourceSetPartialSchema> & ComputeHostOnSourceSetPartialRelations
+
+export const ComputeHostOnSourceSetPartialWithRelationsSchema: z.ZodType<ComputeHostOnSourceSetPartialWithRelations> = ComputeHostOnSourceSetPartialSchema.merge(z.object({
+  sourceSet: z.lazy(() => SourceSetPartialWithRelationsSchema),
+  computeHost: z.lazy(() => ComputeHostPartialWithRelationsSchema),
+})).partial()
+
+export type ComputeHostOnSourceSetWithPartialRelations = z.infer<typeof ComputeHostOnSourceSetSchema> & ComputeHostOnSourceSetPartialRelations
+
+export const ComputeHostOnSourceSetWithPartialRelationsSchema: z.ZodType<ComputeHostOnSourceSetWithPartialRelations> = ComputeHostOnSourceSetSchema.merge(z.object({
+  sourceSet: z.lazy(() => SourceSetPartialWithRelationsSchema),
+  computeHost: z.lazy(() => ComputeHostPartialWithRelationsSchema),
 }).partial())
 
 /////////////////////////////////////////
@@ -1652,7 +1822,7 @@ export const SourceSchema = z.object({
   modelId: z.string(),
   hasDashboards: z.boolean(),
   inferenceEnabled: z.boolean(),
-  saelensConfig: NullableJsonValue.optional(),
+  saelensConfig: JsonValueSchema.nullable(),
   saelensRelease: z.string().nullable(),
   saelensSaeId: z.string().nullable(),
   hfRepoId: z.string().nullable(),
@@ -1686,7 +1856,7 @@ export type SourcePartial = z.infer<typeof SourcePartialSchema>
 //------------------------------------------------------
 
 export type SourceRelations = {
-  inferenceHosts: InferenceHostSourceOnSourceWithRelations[];
+  computeHosts: ComputeHostOnSourceWithRelations[];
   neurons: NeuronWithRelations[];
   defaultOfModel?: ModelWithRelations | null;
   set: SourceSetWithRelations;
@@ -1697,11 +1867,11 @@ export type SourceRelations = {
 };
 
 export type SourceWithRelations = Omit<z.infer<typeof SourceSchema>, "saelensConfig"> & {
-  saelensConfig?: NullableJsonInput;
+  saelensConfig?: JsonValueType | null;
 } & SourceRelations
 
 export const SourceWithRelationsSchema: z.ZodType<SourceWithRelations> = SourceSchema.merge(z.object({
-  inferenceHosts: z.lazy(() => InferenceHostSourceOnSourceWithRelationsSchema).array(),
+  computeHosts: z.lazy(() => ComputeHostOnSourceWithRelationsSchema).array(),
   neurons: z.lazy(() => NeuronWithRelationsSchema).array(),
   defaultOfModel: z.lazy(() => ModelWithRelationsSchema).nullable(),
   set: z.lazy(() => SourceSetWithRelationsSchema),
@@ -1715,7 +1885,7 @@ export const SourceWithRelationsSchema: z.ZodType<SourceWithRelations> = SourceS
 //------------------------------------------------------
 
 export type SourcePartialRelations = {
-  inferenceHosts?: InferenceHostSourceOnSourcePartialWithRelations[];
+  computeHosts?: ComputeHostOnSourcePartialWithRelations[];
   neurons?: NeuronPartialWithRelations[];
   defaultOfModel?: ModelPartialWithRelations | null;
   set?: SourceSetPartialWithRelations;
@@ -1726,11 +1896,11 @@ export type SourcePartialRelations = {
 };
 
 export type SourcePartialWithRelations = Omit<z.infer<typeof SourcePartialSchema>, "saelensConfig"> & {
-  saelensConfig?: NullableJsonInput;
+  saelensConfig?: JsonValueType | null;
 } & SourcePartialRelations
 
 export const SourcePartialWithRelationsSchema: z.ZodType<SourcePartialWithRelations> = SourcePartialSchema.merge(z.object({
-  inferenceHosts: z.lazy(() => InferenceHostSourceOnSourcePartialWithRelationsSchema).array(),
+  computeHosts: z.lazy(() => ComputeHostOnSourcePartialWithRelationsSchema).array(),
   neurons: z.lazy(() => NeuronPartialWithRelationsSchema).array(),
   defaultOfModel: z.lazy(() => ModelPartialWithRelationsSchema).nullable(),
   set: z.lazy(() => SourceSetPartialWithRelationsSchema),
@@ -1741,11 +1911,11 @@ export const SourcePartialWithRelationsSchema: z.ZodType<SourcePartialWithRelati
 })).partial()
 
 export type SourceWithPartialRelations = Omit<z.infer<typeof SourceSchema>, "saelensConfig"> & {
-  saelensConfig?: NullableJsonInput;
+  saelensConfig?: JsonValueType | null;
 } & SourcePartialRelations
 
 export const SourceWithPartialRelationsSchema: z.ZodType<SourceWithPartialRelations> = SourceSchema.merge(z.object({
-  inferenceHosts: z.lazy(() => InferenceHostSourceOnSourcePartialWithRelationsSchema).array(),
+  computeHosts: z.lazy(() => ComputeHostOnSourcePartialWithRelationsSchema).array(),
   neurons: z.lazy(() => NeuronPartialWithRelationsSchema).array(),
   defaultOfModel: z.lazy(() => ModelPartialWithRelationsSchema).nullable(),
   set: z.lazy(() => SourceSetPartialWithRelationsSchema),
@@ -1783,6 +1953,7 @@ export const SourceSetSchema = z.object({
   showCorrelated: z.boolean(),
   showHeadAttribution: z.boolean(),
   showUmap: z.boolean(),
+  externalDashboardsUrl: z.string().nullable(),
   createdAt: z.coerce.date(),
 })
 
@@ -1805,7 +1976,7 @@ export type SourceSetRelations = {
   sources: SourceWithRelations[];
   neurons: NeuronWithRelations[];
   releases?: SourceReleaseWithRelations | null;
-  graphHostSources: GraphHostSourceOnSourceSetWithRelations[];
+  computeHosts: ComputeHostOnSourceSetWithRelations[];
   graphMetadata: GraphMetadataWithRelations[];
   defaultOfModel?: ModelWithRelations | null;
   defaultGraphModel?: ModelWithRelations | null;
@@ -1819,7 +1990,7 @@ export const SourceSetWithRelationsSchema: z.ZodType<SourceSetWithRelations> = S
   sources: z.lazy(() => SourceWithRelationsSchema).array(),
   neurons: z.lazy(() => NeuronWithRelationsSchema).array(),
   releases: z.lazy(() => SourceReleaseWithRelationsSchema).nullable(),
-  graphHostSources: z.lazy(() => GraphHostSourceOnSourceSetWithRelationsSchema).array(),
+  computeHosts: z.lazy(() => ComputeHostOnSourceSetWithRelationsSchema).array(),
   graphMetadata: z.lazy(() => GraphMetadataWithRelationsSchema).array(),
   defaultOfModel: z.lazy(() => ModelWithRelationsSchema).nullable(),
   defaultGraphModel: z.lazy(() => ModelWithRelationsSchema).nullable(),
@@ -1834,7 +2005,7 @@ export type SourceSetPartialRelations = {
   sources?: SourcePartialWithRelations[];
   neurons?: NeuronPartialWithRelations[];
   releases?: SourceReleasePartialWithRelations | null;
-  graphHostSources?: GraphHostSourceOnSourceSetPartialWithRelations[];
+  computeHosts?: ComputeHostOnSourceSetPartialWithRelations[];
   graphMetadata?: GraphMetadataPartialWithRelations[];
   defaultOfModel?: ModelPartialWithRelations | null;
   defaultGraphModel?: ModelPartialWithRelations | null;
@@ -1848,7 +2019,7 @@ export const SourceSetPartialWithRelationsSchema: z.ZodType<SourceSetPartialWith
   sources: z.lazy(() => SourcePartialWithRelationsSchema).array(),
   neurons: z.lazy(() => NeuronPartialWithRelationsSchema).array(),
   releases: z.lazy(() => SourceReleasePartialWithRelationsSchema).nullable(),
-  graphHostSources: z.lazy(() => GraphHostSourceOnSourceSetPartialWithRelationsSchema).array(),
+  computeHosts: z.lazy(() => ComputeHostOnSourceSetPartialWithRelationsSchema).array(),
   graphMetadata: z.lazy(() => GraphMetadataPartialWithRelationsSchema).array(),
   defaultOfModel: z.lazy(() => ModelPartialWithRelationsSchema).nullable(),
   defaultGraphModel: z.lazy(() => ModelPartialWithRelationsSchema).nullable(),
@@ -1862,7 +2033,7 @@ export const SourceSetWithPartialRelationsSchema: z.ZodType<SourceSetWithPartial
   sources: z.lazy(() => SourcePartialWithRelationsSchema).array(),
   neurons: z.lazy(() => NeuronPartialWithRelationsSchema).array(),
   releases: z.lazy(() => SourceReleasePartialWithRelationsSchema).nullable(),
-  graphHostSources: z.lazy(() => GraphHostSourceOnSourceSetPartialWithRelationsSchema).array(),
+  computeHosts: z.lazy(() => ComputeHostOnSourceSetPartialWithRelationsSchema).array(),
   graphMetadata: z.lazy(() => GraphMetadataPartialWithRelationsSchema).array(),
   defaultOfModel: z.lazy(() => ModelPartialWithRelationsSchema).nullable(),
   defaultGraphModel: z.lazy(() => ModelPartialWithRelationsSchema).nullable(),
@@ -1942,12 +2113,12 @@ export const SourceReleaseWithPartialRelationsSchema: z.ZodType<SourceReleaseWit
 /////////////////////////////////////////
 
 export const EvalSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   typeName: z.string(),
   modelId: z.string(),
   sourceId: z.string(),
-  output: InputJsonValue,
-  detailedMetrics: NullableJsonValue.optional(),
+  output: JsonValueSchema,
+  detailedMetrics: JsonValueSchema.nullable(),
   createdAt: z.coerce.date(),
   updatedAt: z.coerce.date(),
 })
@@ -1972,7 +2143,7 @@ export type EvalRelations = {
 };
 
 export type EvalWithRelations = Omit<z.infer<typeof EvalSchema>, "detailedMetrics"> & {
-  detailedMetrics?: NullableJsonInput;
+  detailedMetrics?: JsonValueType | null;
 } & EvalRelations
 
 export const EvalWithRelationsSchema: z.ZodType<EvalWithRelations> = EvalSchema.merge(z.object({
@@ -1991,7 +2162,7 @@ export type EvalPartialRelations = {
 };
 
 export type EvalPartialWithRelations = Omit<z.infer<typeof EvalPartialSchema>, "detailedMetrics"> & {
-  detailedMetrics?: NullableJsonInput;
+  detailedMetrics?: JsonValueType | null;
 } & EvalPartialRelations
 
 export const EvalPartialWithRelationsSchema: z.ZodType<EvalPartialWithRelations> = EvalPartialSchema.merge(z.object({
@@ -2001,7 +2172,7 @@ export const EvalPartialWithRelationsSchema: z.ZodType<EvalPartialWithRelations>
 })).partial()
 
 export type EvalWithPartialRelations = Omit<z.infer<typeof EvalSchema>, "detailedMetrics"> & {
-  detailedMetrics?: NullableJsonInput;
+  detailedMetrics?: JsonValueType | null;
 } & EvalPartialRelations
 
 export const EvalWithPartialRelationsSchema: z.ZodType<EvalWithPartialRelations> = EvalSchema.merge(z.object({
@@ -2019,7 +2190,7 @@ export const EvalTypeSchema = z.object({
   displayName: z.string(),
   description: z.string(),
   longerDescription: z.string(),
-  outputSchema: InputJsonValue,
+  outputSchema: JsonValueSchema,
   featured: z.boolean(),
   url: z.string().nullable(),
   createdAt: z.coerce.date(),
@@ -2132,6 +2303,7 @@ export type NeuronRelations = {
   creator?: UserWithRelations | null;
   activations: ActivationWithRelations[];
   explanations: ExplanationWithRelations[];
+  tokenLists: NeuronTokenListWithRelations[];
   comments: CommentWithRelations[];
   bookmarks: BookmarkWithRelations[];
   model: ModelWithRelations;
@@ -2147,6 +2319,7 @@ export const NeuronWithRelationsSchema: z.ZodType<NeuronWithRelations> = NeuronS
   creator: z.lazy(() => UserWithRelationsSchema).nullable(),
   activations: z.lazy(() => ActivationWithRelationsSchema).array(),
   explanations: z.lazy(() => ExplanationWithRelationsSchema).array(),
+  tokenLists: z.lazy(() => NeuronTokenListWithRelationsSchema).array(),
   comments: z.lazy(() => CommentWithRelationsSchema).array(),
   bookmarks: z.lazy(() => BookmarkWithRelationsSchema).array(),
   model: z.lazy(() => ModelWithRelationsSchema),
@@ -2163,6 +2336,7 @@ export type NeuronPartialRelations = {
   creator?: UserPartialWithRelations | null;
   activations?: ActivationPartialWithRelations[];
   explanations?: ExplanationPartialWithRelations[];
+  tokenLists?: NeuronTokenListPartialWithRelations[];
   comments?: CommentPartialWithRelations[];
   bookmarks?: BookmarkPartialWithRelations[];
   model?: ModelPartialWithRelations;
@@ -2178,6 +2352,7 @@ export const NeuronPartialWithRelationsSchema: z.ZodType<NeuronPartialWithRelati
   creator: z.lazy(() => UserPartialWithRelationsSchema).nullable(),
   activations: z.lazy(() => ActivationPartialWithRelationsSchema).array(),
   explanations: z.lazy(() => ExplanationPartialWithRelationsSchema).array(),
+  tokenLists: z.lazy(() => NeuronTokenListPartialWithRelationsSchema).array(),
   comments: z.lazy(() => CommentPartialWithRelationsSchema).array(),
   bookmarks: z.lazy(() => BookmarkPartialWithRelationsSchema).array(),
   model: z.lazy(() => ModelPartialWithRelationsSchema),
@@ -2193,6 +2368,7 @@ export const NeuronWithPartialRelationsSchema: z.ZodType<NeuronWithPartialRelati
   creator: z.lazy(() => UserPartialWithRelationsSchema).nullable(),
   activations: z.lazy(() => ActivationPartialWithRelationsSchema).array(),
   explanations: z.lazy(() => ExplanationPartialWithRelationsSchema).array(),
+  tokenLists: z.lazy(() => NeuronTokenListPartialWithRelationsSchema).array(),
   comments: z.lazy(() => CommentPartialWithRelationsSchema).array(),
   bookmarks: z.lazy(() => BookmarkPartialWithRelationsSchema).array(),
   model: z.lazy(() => ModelPartialWithRelationsSchema),
@@ -2204,7 +2380,9 @@ export const NeuronWithPartialRelationsSchema: z.ZodType<NeuronWithPartialRelati
 /////////////////////////////////////////
 
 export const ExplanationSchema = z.object({
-  id: z.string().cuid(),
+  pole: ExplanationPoleSchema.nullable(),
+  aspect: ExplanationAspectSchema.nullable(),
+  id: z.cuid(),
   modelId: z.string(),
   layer: z.string(),
   index: z.string(),
@@ -2220,6 +2398,11 @@ export const ExplanationSchema = z.object({
   umap_log_feature_sparsity: z.number().nullable(),
   typeName: z.string().nullable(),
   explanationModelName: z.string().nullable(),
+  steerStrength: z.number().nullable(),
+  sourceUrl: z.string().nullable(),
+  contributorName: z.string().nullable(),
+  contributorUrl: z.string().nullable(),
+  metadata: JsonValueSchema.nullable(),
   createdAt: z.coerce.date(),
   updatedAt: z.coerce.date(),
 })
@@ -2249,7 +2432,9 @@ export type ExplanationRelations = {
   activationsV1: ExplanationActivationV1WithRelations[];
 };
 
-export type ExplanationWithRelations = z.infer<typeof ExplanationSchema> & ExplanationRelations
+export type ExplanationWithRelations = Omit<z.infer<typeof ExplanationSchema>, "metadata"> & {
+  metadata?: JsonValueType | null;
+} & ExplanationRelations
 
 export const ExplanationWithRelationsSchema: z.ZodType<ExplanationWithRelations> = ExplanationSchema.merge(z.object({
   author: z.lazy(() => UserWithRelationsSchema),
@@ -2278,7 +2463,9 @@ export type ExplanationPartialRelations = {
   activationsV1?: ExplanationActivationV1PartialWithRelations[];
 };
 
-export type ExplanationPartialWithRelations = z.infer<typeof ExplanationPartialSchema> & ExplanationPartialRelations
+export type ExplanationPartialWithRelations = Omit<z.infer<typeof ExplanationPartialSchema>, "metadata"> & {
+  metadata?: JsonValueType | null;
+} & ExplanationPartialRelations
 
 export const ExplanationPartialWithRelationsSchema: z.ZodType<ExplanationPartialWithRelations> = ExplanationPartialSchema.merge(z.object({
   author: z.lazy(() => UserPartialWithRelationsSchema),
@@ -2292,7 +2479,9 @@ export const ExplanationPartialWithRelationsSchema: z.ZodType<ExplanationPartial
   activationsV1: z.lazy(() => ExplanationActivationV1PartialWithRelationsSchema).array(),
 })).partial()
 
-export type ExplanationWithPartialRelations = z.infer<typeof ExplanationSchema> & ExplanationPartialRelations
+export type ExplanationWithPartialRelations = Omit<z.infer<typeof ExplanationSchema>, "metadata"> & {
+  metadata?: JsonValueType | null;
+} & ExplanationPartialRelations
 
 export const ExplanationWithPartialRelationsSchema: z.ZodType<ExplanationWithPartialRelations> = ExplanationSchema.merge(z.object({
   author: z.lazy(() => UserPartialWithRelationsSchema),
@@ -2311,7 +2500,7 @@ export const ExplanationWithPartialRelationsSchema: z.ZodType<ExplanationWithPar
 /////////////////////////////////////////
 
 export const ExplanationModelSettingsSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   temperature: z.number().nullable(),
   maxTokens: z.number().int().nullable(),
   topP: z.number().nullable(),
@@ -2433,6 +2622,9 @@ export const ExplanationTypeSchema = z.object({
   url: z.string().nullable(),
   creatorName: z.string(),
   creatorId: z.string(),
+  license: z.string().nullable(),
+  licenseUrl: z.string().nullable(),
+  citation: z.string().nullable(),
   createdAt: z.coerce.date(),
   updatedAt: z.coerce.date(),
 })
@@ -2454,6 +2646,7 @@ export type ExplanationTypeRelations = {
   explainerModelSettings?: ExplanationModelSettingsWithRelations | null;
   creator: UserWithRelations;
   explanations: ExplanationWithRelations[];
+  tokenLists: NeuronTokenListWithRelations[];
 };
 
 export type ExplanationTypeWithRelations = z.infer<typeof ExplanationTypeSchema> & ExplanationTypeRelations
@@ -2462,6 +2655,7 @@ export const ExplanationTypeWithRelationsSchema: z.ZodType<ExplanationTypeWithRe
   explainerModelSettings: z.lazy(() => ExplanationModelSettingsWithRelationsSchema).nullable(),
   creator: z.lazy(() => UserWithRelationsSchema),
   explanations: z.lazy(() => ExplanationWithRelationsSchema).array(),
+  tokenLists: z.lazy(() => NeuronTokenListWithRelationsSchema).array(),
 }))
 
 // EXPLANATION TYPE PARTIAL RELATION SCHEMA
@@ -2471,6 +2665,7 @@ export type ExplanationTypePartialRelations = {
   explainerModelSettings?: ExplanationModelSettingsPartialWithRelations | null;
   creator?: UserPartialWithRelations;
   explanations?: ExplanationPartialWithRelations[];
+  tokenLists?: NeuronTokenListPartialWithRelations[];
 };
 
 export type ExplanationTypePartialWithRelations = z.infer<typeof ExplanationTypePartialSchema> & ExplanationTypePartialRelations
@@ -2479,6 +2674,7 @@ export const ExplanationTypePartialWithRelationsSchema: z.ZodType<ExplanationTyp
   explainerModelSettings: z.lazy(() => ExplanationModelSettingsPartialWithRelationsSchema).nullable(),
   creator: z.lazy(() => UserPartialWithRelationsSchema),
   explanations: z.lazy(() => ExplanationPartialWithRelationsSchema).array(),
+  tokenLists: z.lazy(() => NeuronTokenListPartialWithRelationsSchema).array(),
 })).partial()
 
 export type ExplanationTypeWithPartialRelations = z.infer<typeof ExplanationTypeSchema> & ExplanationTypePartialRelations
@@ -2487,6 +2683,86 @@ export const ExplanationTypeWithPartialRelationsSchema: z.ZodType<ExplanationTyp
   explainerModelSettings: z.lazy(() => ExplanationModelSettingsPartialWithRelationsSchema).nullable(),
   creator: z.lazy(() => UserPartialWithRelationsSchema),
   explanations: z.lazy(() => ExplanationPartialWithRelationsSchema).array(),
+  tokenLists: z.lazy(() => NeuronTokenListPartialWithRelationsSchema).array(),
+}).partial())
+
+/////////////////////////////////////////
+// NEURON TOKEN LIST SCHEMA
+/////////////////////////////////////////
+
+export const NeuronTokenListSchema = z.object({
+  pole: ExplanationPoleSchema,
+  aspect: ExplanationAspectSchema,
+  id: z.cuid(),
+  modelId: z.string(),
+  layer: z.string(),
+  index: z.string(),
+  typeName: z.string(),
+  creatorId: z.string(),
+  name: z.string(),
+  tokens: z.string().array(),
+  values: z.number().array(),
+  metadata: JsonValueSchema.nullable(),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
+})
+
+export type NeuronTokenList = z.infer<typeof NeuronTokenListSchema>
+
+/////////////////////////////////////////
+// NEURON TOKEN LIST PARTIAL SCHEMA
+/////////////////////////////////////////
+
+export const NeuronTokenListPartialSchema = NeuronTokenListSchema.partial()
+
+export type NeuronTokenListPartial = z.infer<typeof NeuronTokenListPartialSchema>
+
+// NEURON TOKEN LIST RELATION SCHEMA
+//------------------------------------------------------
+
+export type NeuronTokenListRelations = {
+  neuron: NeuronWithRelations;
+  type: ExplanationTypeWithRelations;
+  creator: UserWithRelations;
+};
+
+export type NeuronTokenListWithRelations = Omit<z.infer<typeof NeuronTokenListSchema>, "metadata"> & {
+  metadata?: JsonValueType | null;
+} & NeuronTokenListRelations
+
+export const NeuronTokenListWithRelationsSchema: z.ZodType<NeuronTokenListWithRelations> = NeuronTokenListSchema.merge(z.object({
+  neuron: z.lazy(() => NeuronWithRelationsSchema),
+  type: z.lazy(() => ExplanationTypeWithRelationsSchema),
+  creator: z.lazy(() => UserWithRelationsSchema),
+}))
+
+// NEURON TOKEN LIST PARTIAL RELATION SCHEMA
+//------------------------------------------------------
+
+export type NeuronTokenListPartialRelations = {
+  neuron?: NeuronPartialWithRelations;
+  type?: ExplanationTypePartialWithRelations;
+  creator?: UserPartialWithRelations;
+};
+
+export type NeuronTokenListPartialWithRelations = Omit<z.infer<typeof NeuronTokenListPartialSchema>, "metadata"> & {
+  metadata?: JsonValueType | null;
+} & NeuronTokenListPartialRelations
+
+export const NeuronTokenListPartialWithRelationsSchema: z.ZodType<NeuronTokenListPartialWithRelations> = NeuronTokenListPartialSchema.merge(z.object({
+  neuron: z.lazy(() => NeuronPartialWithRelationsSchema),
+  type: z.lazy(() => ExplanationTypePartialWithRelationsSchema),
+  creator: z.lazy(() => UserPartialWithRelationsSchema),
+})).partial()
+
+export type NeuronTokenListWithPartialRelations = Omit<z.infer<typeof NeuronTokenListSchema>, "metadata"> & {
+  metadata?: JsonValueType | null;
+} & NeuronTokenListPartialRelations
+
+export const NeuronTokenListWithPartialRelationsSchema: z.ZodType<NeuronTokenListWithPartialRelations> = NeuronTokenListSchema.merge(z.object({
+  neuron: z.lazy(() => NeuronPartialWithRelationsSchema),
+  type: z.lazy(() => ExplanationTypePartialWithRelationsSchema),
+  creator: z.lazy(() => UserPartialWithRelationsSchema),
 }).partial())
 
 /////////////////////////////////////////
@@ -2494,7 +2770,7 @@ export const ExplanationTypeWithPartialRelationsSchema: z.ZodType<ExplanationTyp
 /////////////////////////////////////////
 
 export const ExplanationScoreSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   initiatedByUserId: z.string(),
   value: z.number(),
   explanationId: z.string(),
@@ -2691,7 +2967,7 @@ export const ExplanationScoreModelWithPartialRelationsSchema: z.ZodType<Explanat
 /////////////////////////////////////////
 
 export const ExplanationActivationV1Schema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   explanationId: z.string(),
   activationId: z.string(),
   expectedValues: z.number().array(),
@@ -2759,7 +3035,7 @@ export const ExplanationActivationV1WithPartialRelationsSchema: z.ZodType<Explan
 /////////////////////////////////////////
 
 export const VoteSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   voterId: z.string(),
   reason: z.string().nullable(),
   points: z.number().int(),
@@ -2820,7 +3096,7 @@ export const VoteWithPartialRelationsSchema: z.ZodType<VoteWithPartialRelations>
 /////////////////////////////////////////
 
 export const ActivationSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   tokens: z.string().array(),
   dataIndex: z.string().nullable(),
   index: z.string(),
@@ -2914,7 +3190,7 @@ export const ActivationWithPartialRelationsSchema: z.ZodType<ActivationWithParti
 /////////////////////////////////////////
 
 export const CommentSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   modelId: z.string(),
   layer: z.string(),
   index: z.string(),
@@ -2975,7 +3251,7 @@ export const CommentWithPartialRelationsSchema: z.ZodType<CommentWithPartialRela
 /////////////////////////////////////////
 
 export const BookmarkSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   modelId: z.string(),
   layer: z.string(),
   index: z.string(),
@@ -3035,7 +3311,7 @@ export const BookmarkWithPartialRelationsSchema: z.ZodType<BookmarkWithPartialRe
 /////////////////////////////////////////
 
 export const SavedSearchSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   query: z.string(),
   tokens: z.string().array(),
   modelId: z.string(),
@@ -3225,7 +3501,7 @@ export const SteerOutputToNeuronWithPartialRelationsSchema: z.ZodType<SteerOutpu
 
 export const SteerOutputSchema = z.object({
   type: SteerOutputTypeSchema,
-  id: z.string().cuid(),
+  id: z.cuid(),
   modelId: z.string(),
   steerSpecialTokens: z.boolean(),
   inputText: z.string(),
@@ -3237,6 +3513,7 @@ export const SteerOutputSchema = z.object({
   temperature: z.number(),
   numTokens: z.number().int(),
   freqPenalty: z.number(),
+  presencePenalty: z.number(),
   seed: z.number(),
   strengthMultiplier: z.number(),
   steerMethod: z.string(),
@@ -3416,7 +3693,7 @@ export const ProblemNodeWithPartialRelationsSchema: z.ZodType<ProblemNodeWithPar
 export const ProblemEdgeSchema = z.object({
   type: ProblemEdgeTypeSchema,
   approvalState: ProblemNodeApprovalStateSchema,
-  id: z.string().cuid(),
+  id: z.cuid(),
   sourceNodeId: z.number().int(),
   targetNodeId: z.number().int(),
   approverId: z.string().nullable(),
@@ -3486,7 +3763,7 @@ export const ProblemEdgeWithPartialRelationsSchema: z.ZodType<ProblemEdgeWithPar
 /////////////////////////////////////////
 
 export const ProblemNodeCommentSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   problemNodeId: z.number().int(),
   parentCommentId: z.string().nullable(),
   text: z.string(),
@@ -3557,7 +3834,7 @@ export const ProblemNodeCommentWithPartialRelationsSchema: z.ZodType<ProblemNode
 /////////////////////////////////////////
 
 export const ProblemNodeLogSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   timestamp: z.coerce.date(),
   userId: z.string(),
   problemNodeId: z.number().int(),
@@ -3626,7 +3903,6 @@ export const NlaSourceSchema = z.object({
   av: z.string(),
   ar: z.string(),
   layerNum: z.number().int(),
-  servers: z.string().array(),
   norm: z.number(),
   createdAt: z.coerce.date(),
 })
@@ -3646,6 +3922,7 @@ export type NlaSourcePartial = z.infer<typeof NlaSourcePartialSchema>
 
 export type NlaSourceRelations = {
   model: ModelWithRelations;
+  computeHosts: ComputeHostWithRelations[];
   cachedEntries: NlaExplainCacheWithRelations[];
 };
 
@@ -3653,6 +3930,7 @@ export type NlaSourceWithRelations = z.infer<typeof NlaSourceSchema> & NlaSource
 
 export const NlaSourceWithRelationsSchema: z.ZodType<NlaSourceWithRelations> = NlaSourceSchema.merge(z.object({
   model: z.lazy(() => ModelWithRelationsSchema),
+  computeHosts: z.lazy(() => ComputeHostWithRelationsSchema).array(),
   cachedEntries: z.lazy(() => NlaExplainCacheWithRelationsSchema).array(),
 }))
 
@@ -3661,6 +3939,7 @@ export const NlaSourceWithRelationsSchema: z.ZodType<NlaSourceWithRelations> = N
 
 export type NlaSourcePartialRelations = {
   model?: ModelPartialWithRelations;
+  computeHosts?: ComputeHostPartialWithRelations[];
   cachedEntries?: NlaExplainCachePartialWithRelations[];
 };
 
@@ -3668,6 +3947,7 @@ export type NlaSourcePartialWithRelations = z.infer<typeof NlaSourcePartialSchem
 
 export const NlaSourcePartialWithRelationsSchema: z.ZodType<NlaSourcePartialWithRelations> = NlaSourcePartialSchema.merge(z.object({
   model: z.lazy(() => ModelPartialWithRelationsSchema),
+  computeHosts: z.lazy(() => ComputeHostPartialWithRelationsSchema).array(),
   cachedEntries: z.lazy(() => NlaExplainCachePartialWithRelationsSchema).array(),
 })).partial()
 
@@ -3675,6 +3955,7 @@ export type NlaSourceWithPartialRelations = z.infer<typeof NlaSourceSchema> & Nl
 
 export const NlaSourceWithPartialRelationsSchema: z.ZodType<NlaSourceWithPartialRelations> = NlaSourceSchema.merge(z.object({
   model: z.lazy(() => ModelPartialWithRelationsSchema),
+  computeHosts: z.lazy(() => ComputeHostPartialWithRelationsSchema).array(),
   cachedEntries: z.lazy(() => NlaExplainCachePartialWithRelationsSchema).array(),
 }).partial())
 
@@ -3683,7 +3964,7 @@ export const NlaSourceWithPartialRelationsSchema: z.ZodType<NlaSourceWithPartial
 /////////////////////////////////////////
 
 export const NlaExplainCacheSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   text: z.string(),
   /**
    * SHA-256 hex of `text` (UTF-8); used in the unique key so btree stays under Postgres row-size limits.
@@ -3756,7 +4037,7 @@ export const NlaExplainCacheWithPartialRelationsSchema: z.ZodType<NlaExplainCach
 /////////////////////////////////////////
 
 export const NlaExplainShareSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   cacheId: z.string(),
   position: z.number().int().nullable(),
   paragraph: z.number().int().nullable(),
@@ -3815,7 +4096,7 @@ export const NlaExplainShareWithPartialRelationsSchema: z.ZodType<NlaExplainShar
 /////////////////////////////////////////
 
 export const SampleDatasetSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   name: z.string(),
   description: z.string().nullable(),
   url: z.string().nullable(),
@@ -3871,12 +4152,12 @@ export const SampleDatasetWithPartialRelationsSchema: z.ZodType<SampleDatasetWit
 
 export const SampleSchema = z.object({
   type: ProbeSampleTypeSchema,
-  id: z.string().cuid(),
+  id: z.cuid(),
   modelId: z.string(),
   datasetId: z.string(),
   sampleIndex: z.number().int(),
   groundTruth: z.boolean(),
-  conversation: InputJsonValue,
+  conversation: JsonValueSchema,
   conversationTokenized: z.number().int().array(),
   conversationTokenizedStr: z.string().array(),
   finalResponseStartIndex: z.number().int(),
@@ -3953,7 +4234,7 @@ export const ProbeSchema = z.object({
   architecture: ProbeArchitectureSchema,
   tokenSelection: TokenSelectionSchema,
   reductionMethod: ReductionMethodSchema,
-  id: z.string().cuid(),
+  id: z.cuid(),
   customLabel: z.string(),
   modelId: z.string(),
   userId: z.string(),
@@ -4023,7 +4304,7 @@ export const ProbeWithPartialRelationsSchema: z.ZodType<ProbeWithPartialRelation
 /////////////////////////////////////////
 
 export const ProbeMatchSchema = z.object({
-  id: z.string().cuid(),
+  id: z.cuid(),
   probeId: z.string(),
   sampleId: z.string(),
   probeCorrect: z.boolean(),
@@ -4085,12 +4366,12 @@ export const ProbeMatchWithPartialRelationsSchema: z.ZodType<ProbeMatchWithParti
 
 export const ProbeLogSchema = z.object({
   action: ProbeLogActionSchema,
-  id: z.string().cuid(),
+  id: z.cuid(),
   modelId: z.string(),
   userId: z.string().nullable(),
   probeId: z.string().nullable(),
   sampleId: z.string().nullable(),
-  details: NullableJsonValue.optional(),
+  details: JsonValueSchema.nullable(),
   createdAt: z.coerce.date(),
 })
 
@@ -4112,7 +4393,7 @@ export const ProcessLockSchema = z.object({
   name: z.string(),
   startedAt: z.coerce.date(),
   expiresAt: z.coerce.date(),
-  details: NullableJsonValue.optional(),
+  details: JsonValueSchema.nullable(),
 })
 
 export type ProcessLock = z.infer<typeof ProcessLockSchema>
@@ -4124,3 +4405,196 @@ export type ProcessLock = z.infer<typeof ProcessLockSchema>
 export const ProcessLockPartialSchema = ProcessLockSchema.partial()
 
 export type ProcessLockPartial = z.infer<typeof ProcessLockPartialSchema>
+
+/////////////////////////////////////////
+// VECTOR TAG SCHEMA
+/////////////////////////////////////////
+
+export const VectorTagSchema = z.object({
+  name: z.string(),
+  displayName: z.string(),
+  description: z.string(),
+  creatorId: z.string().nullable(),
+  createdAt: z.coerce.date(),
+})
+
+export type VectorTag = z.infer<typeof VectorTagSchema>
+
+/////////////////////////////////////////
+// VECTOR TAG PARTIAL SCHEMA
+/////////////////////////////////////////
+
+export const VectorTagPartialSchema = VectorTagSchema.partial()
+
+export type VectorTagPartial = z.infer<typeof VectorTagPartialSchema>
+
+// VECTOR TAG RELATION SCHEMA
+//------------------------------------------------------
+
+export type VectorTagRelations = {
+  creator?: UserWithRelations | null;
+  vectors: VectorTagOnVectorWithRelations[];
+};
+
+export type VectorTagWithRelations = z.infer<typeof VectorTagSchema> & VectorTagRelations
+
+export const VectorTagWithRelationsSchema: z.ZodType<VectorTagWithRelations> = VectorTagSchema.merge(z.object({
+  creator: z.lazy(() => UserWithRelationsSchema).nullable(),
+  vectors: z.lazy(() => VectorTagOnVectorWithRelationsSchema).array(),
+}))
+
+// VECTOR TAG PARTIAL RELATION SCHEMA
+//------------------------------------------------------
+
+export type VectorTagPartialRelations = {
+  creator?: UserPartialWithRelations | null;
+  vectors?: VectorTagOnVectorPartialWithRelations[];
+};
+
+export type VectorTagPartialWithRelations = z.infer<typeof VectorTagPartialSchema> & VectorTagPartialRelations
+
+export const VectorTagPartialWithRelationsSchema: z.ZodType<VectorTagPartialWithRelations> = VectorTagPartialSchema.merge(z.object({
+  creator: z.lazy(() => UserPartialWithRelationsSchema).nullable(),
+  vectors: z.lazy(() => VectorTagOnVectorPartialWithRelationsSchema).array(),
+})).partial()
+
+export type VectorTagWithPartialRelations = z.infer<typeof VectorTagSchema> & VectorTagPartialRelations
+
+export const VectorTagWithPartialRelationsSchema: z.ZodType<VectorTagWithPartialRelations> = VectorTagSchema.merge(z.object({
+  creator: z.lazy(() => UserPartialWithRelationsSchema).nullable(),
+  vectors: z.lazy(() => VectorTagOnVectorPartialWithRelationsSchema).array(),
+}).partial())
+
+/////////////////////////////////////////
+// VECTOR TAG ON VECTOR SCHEMA
+/////////////////////////////////////////
+
+export const VectorTagOnVectorSchema = z.object({
+  vectorId: z.string(),
+  tagName: z.string(),
+  addedAt: z.coerce.date(),
+})
+
+export type VectorTagOnVector = z.infer<typeof VectorTagOnVectorSchema>
+
+/////////////////////////////////////////
+// VECTOR TAG ON VECTOR PARTIAL SCHEMA
+/////////////////////////////////////////
+
+export const VectorTagOnVectorPartialSchema = VectorTagOnVectorSchema.partial()
+
+export type VectorTagOnVectorPartial = z.infer<typeof VectorTagOnVectorPartialSchema>
+
+// VECTOR TAG ON VECTOR RELATION SCHEMA
+//------------------------------------------------------
+
+export type VectorTagOnVectorRelations = {
+  vector: VectorWithRelations;
+  tag: VectorTagWithRelations;
+};
+
+export type VectorTagOnVectorWithRelations = z.infer<typeof VectorTagOnVectorSchema> & VectorTagOnVectorRelations
+
+export const VectorTagOnVectorWithRelationsSchema: z.ZodType<VectorTagOnVectorWithRelations> = VectorTagOnVectorSchema.merge(z.object({
+  vector: z.lazy(() => VectorWithRelationsSchema),
+  tag: z.lazy(() => VectorTagWithRelationsSchema),
+}))
+
+// VECTOR TAG ON VECTOR PARTIAL RELATION SCHEMA
+//------------------------------------------------------
+
+export type VectorTagOnVectorPartialRelations = {
+  vector?: VectorPartialWithRelations;
+  tag?: VectorTagPartialWithRelations;
+};
+
+export type VectorTagOnVectorPartialWithRelations = z.infer<typeof VectorTagOnVectorPartialSchema> & VectorTagOnVectorPartialRelations
+
+export const VectorTagOnVectorPartialWithRelationsSchema: z.ZodType<VectorTagOnVectorPartialWithRelations> = VectorTagOnVectorPartialSchema.merge(z.object({
+  vector: z.lazy(() => VectorPartialWithRelationsSchema),
+  tag: z.lazy(() => VectorTagPartialWithRelationsSchema),
+})).partial()
+
+export type VectorTagOnVectorWithPartialRelations = z.infer<typeof VectorTagOnVectorSchema> & VectorTagOnVectorPartialRelations
+
+export const VectorTagOnVectorWithPartialRelationsSchema: z.ZodType<VectorTagOnVectorWithPartialRelations> = VectorTagOnVectorSchema.merge(z.object({
+  vector: z.lazy(() => VectorPartialWithRelationsSchema),
+  tag: z.lazy(() => VectorTagPartialWithRelationsSchema),
+}).partial())
+
+/////////////////////////////////////////
+// VECTOR SCHEMA
+/////////////////////////////////////////
+
+export const VectorSchema = z.object({
+  visibility: VisibilitySchema,
+  id: z.cuid(),
+  modelId: z.string(),
+  name: z.string(),
+  author: z.string(),
+  layers: z.number().int().array(),
+  polePositive: z.string().nullable(),
+  poleNegative: z.string().nullable(),
+  polePositiveDescription: z.string().nullable(),
+  poleNegativeDescription: z.string().nullable(),
+  displayName: z.string().nullable(),
+  caveat: z.string().nullable(),
+  values: z.number().array(),
+  projectionParams: JsonValueSchema,
+  hfRepoId: z.string().nullable(),
+  hfFolderId: z.string().nullable(),
+  creatorId: z.string(),
+  createdAt: z.coerce.date(),
+})
+
+export type Vector = z.infer<typeof VectorSchema>
+
+/////////////////////////////////////////
+// VECTOR PARTIAL SCHEMA
+/////////////////////////////////////////
+
+export const VectorPartialSchema = VectorSchema.partial()
+
+export type VectorPartial = z.infer<typeof VectorPartialSchema>
+
+// VECTOR RELATION SCHEMA
+//------------------------------------------------------
+
+export type VectorRelations = {
+  model: ModelWithRelations;
+  tags: VectorTagOnVectorWithRelations[];
+  creator: UserWithRelations;
+};
+
+export type VectorWithRelations = z.infer<typeof VectorSchema> & VectorRelations
+
+export const VectorWithRelationsSchema: z.ZodType<VectorWithRelations> = VectorSchema.merge(z.object({
+  model: z.lazy(() => ModelWithRelationsSchema),
+  tags: z.lazy(() => VectorTagOnVectorWithRelationsSchema).array(),
+  creator: z.lazy(() => UserWithRelationsSchema),
+}))
+
+// VECTOR PARTIAL RELATION SCHEMA
+//------------------------------------------------------
+
+export type VectorPartialRelations = {
+  model?: ModelPartialWithRelations;
+  tags?: VectorTagOnVectorPartialWithRelations[];
+  creator?: UserPartialWithRelations;
+};
+
+export type VectorPartialWithRelations = z.infer<typeof VectorPartialSchema> & VectorPartialRelations
+
+export const VectorPartialWithRelationsSchema: z.ZodType<VectorPartialWithRelations> = VectorPartialSchema.merge(z.object({
+  model: z.lazy(() => ModelPartialWithRelationsSchema),
+  tags: z.lazy(() => VectorTagOnVectorPartialWithRelationsSchema).array(),
+  creator: z.lazy(() => UserPartialWithRelationsSchema),
+})).partial()
+
+export type VectorWithPartialRelations = z.infer<typeof VectorSchema> & VectorPartialRelations
+
+export const VectorWithPartialRelationsSchema: z.ZodType<VectorWithPartialRelations> = VectorSchema.merge(z.object({
+  model: z.lazy(() => ModelPartialWithRelationsSchema),
+  tags: z.lazy(() => VectorTagOnVectorPartialWithRelationsSchema).array(),
+  creator: z.lazy(() => UserPartialWithRelationsSchema),
+}).partial())

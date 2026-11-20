@@ -1,3 +1,4 @@
+import type { DescribeResponse, ScoreResponse } from '@/lib/api/nla-types';
 import { prisma } from '@/lib/db';
 import { nlaFetch } from '@/lib/db/nla-source';
 import { getOAIEmbedding } from '@/lib/external/embedding';
@@ -85,8 +86,7 @@ function cosineSimilarity(a: number[], b: number[]): number {
 export const generateScoreNlaReconstructor = async (explanation: Explanation, user: AuthenticatedUser) => {
   const { latent, source, index, nlaSourceId } = await fetchLatentForExplanation(explanation);
 
-  // `nlaFetch` (vs the legacy single-shot `getNlaServerUrl()`) gives us
-  // shuffle + failover across the NlaSource row's `servers[]`, plus
+  // `nlaFetch` gives us shuffle + failover across the source's hosts, plus
   // automatic auth-header injection. The request-level fail-fast
   // semaphores on the NLA server (`NLA_RECONSTRUCTOR_MAX_CONCURRENT`)
   // mean we may see 429s under load — those bubble up as scorer errors
@@ -104,7 +104,7 @@ export const generateScoreNlaReconstructor = async (explanation: Explanation, us
     throw new Error(`NLA server error: ${nlaResponse.status} - ${errorText}`);
   }
 
-  const nlaResult = (await nlaResponse.json()) as { mse: number; cosine_similarity: number };
+  const nlaResult = (await nlaResponse.json()) as ScoreResponse;
 
   const jsonDetails = {
     mse: nlaResult.mse,
@@ -138,7 +138,7 @@ async function generateScoreNlaVerbalizerInner(
 
   // 1. Get NLA explanation via /describe (non-streaming). Same nlaFetch
   // semantics as nla_reconstructor above — shuffle + failover across the
-  // (model, layer) NlaSource's `servers[]`.
+  // hosts registered for that (model, layer) NlaSource.
   const describeResponse = await nlaFetch(explanation.modelId, nlaSourceId, '/describe', {
     method: 'POST',
     body: JSON.stringify({
@@ -154,9 +154,7 @@ async function generateScoreNlaVerbalizerInner(
     throw new Error(`NLA server error: ${describeResponse.status} - ${errorText}`);
   }
 
-  const describeResult = (await describeResponse.json()) as {
-    results: { description: string; mse?: number; cosine_similarity?: number }[];
-  };
+  const describeResult = (await describeResponse.json()) as DescribeResponse;
   const fullNlaExplanation = describeResult.results[0]?.description;
   if (!fullNlaExplanation) {
     throw new Error('NLA server returned no description');

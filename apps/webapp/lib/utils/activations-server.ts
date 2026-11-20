@@ -1,4 +1,8 @@
-import { ACTIVATIONS_SERVER, ACTIVATIONS_SERVER_SECRET } from '@/lib/env';
+import { resolveHost } from '@/lib/db/compute-host';
+import { getTransformerLensModelIdIfExists } from '@/lib/db/model';
+import { INFERENCE_SERVER_SECRET } from '@/lib/env';
+import { INFERENCE_REQUEST_TIMEOUT_MS, throwIfInferenceError } from '@/lib/utils/inference';
+import { ComputeService } from '@prisma/client';
 
 export const ACTIVATION_RAW_MAX_PROMPT_CHAR_LENGTH = 8000;
 export const ACTIVATION_RAW_MAX_PROMPTS_PER_BATCH = 16;
@@ -9,6 +13,8 @@ type ActivationRawType = 'final_output_token';
 export type ActivationRawRequest = {
   model: string;
   prompts: string[];
+  /** Omit for every layer. */
+  layers?: number[];
   hook_point?: ActivationRawHookPoint;
   type?: ActivationRawType;
 };
@@ -33,26 +39,34 @@ export type ActivationRawResponse = {
   results: ActivationRawPromptResult[];
 };
 
+/**
+ * Residual stream vectors at each prompt's final token, straight from the model.
+ *
+ * Still a hand-written fetch, though `/v1/activation/raw` is now in the spec and could go
+ * through the typed client like the rest.
+ */
 export async function getRawActivations(request: ActivationRawRequest): Promise<ActivationRawResponse> {
-  const response = await fetch(`${ACTIVATIONS_SERVER}/raw`, {
+  const transformerLensModelId = await getTransformerLensModelIdIfExists(request.model);
+  const host = await resolveHost({ service: ComputeService.INFERENCE, modelId: request.model });
+
+  const response = await fetch(`${host}/v1/activation/raw`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      ...(ACTIVATIONS_SERVER_SECRET ? { 'X-SECRET-KEY': ACTIVATIONS_SERVER_SECRET } : {}),
+      'X-SECRET-KEY': INFERENCE_SERVER_SECRET,
+      'Accept-Encoding': 'gzip',
     },
     body: JSON.stringify({
-      model: request.model,
+      model: transformerLensModelId,
       prompts: request.prompts,
+      layers: request.layers,
       hook_point: request.hook_point ?? 'residual_stream',
       type: request.type ?? 'final_output_token',
     }),
     cache: 'no-store',
+    signal: AbortSignal.timeout(INFERENCE_REQUEST_TIMEOUT_MS),
   });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Activations server error (${response.status}): ${errorText}`);
-  }
+  await throwIfInferenceError(response);
 
   return (await response.json()) as ActivationRawResponse;
 }

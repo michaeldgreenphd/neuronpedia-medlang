@@ -30,6 +30,11 @@ export const DEFAULT_MODELID = process.env.NEXT_PUBLIC_DEFAULT_MODELID || '';
 export const DEFAULT_SOURCESET = process.env.NEXT_PUBLIC_DEFAULT_SOURCESET || '';
 export const DEFAULT_SOURCE = process.env.NEXT_PUBLIC_DEFAULT_SOURCE || '';
 export const DEFAULT_STEER_MODEL = process.env.NEXT_PUBLIC_DEFAULT_STEER_MODEL || '';
+// Models whose inference servers load the J++ Lens (JPP_LENS=true). Comma-separated.
+export const JPP_LENS_MODEL_IDS =
+  process.env.NEXT_PUBLIC_JPP_LENS_MODEL_IDS?.split(',')
+    .map((m) => m.trim())
+    .filter((m) => m) || [];
 export const STEER_FORCE_ALLOW_INSTRUCT_MODELS =
   process.env.NEXT_PUBLIC_STEER_FORCE_ALLOW_INSTRUCT_MODELS?.split(',').map((m) => m.trim()) || [];
 
@@ -70,6 +75,8 @@ export const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 export const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 export const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 export const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
+// TypeSafe (Jev) - explanation scoring. Server key only; there is no per-user key type for it.
+export const TYPESAFE_API_KEY = process.env.TYPESAFE_API_KEY || '';
 export const HF_TOKEN = process.env.HF_TOKEN || '';
 
 // These keys are used to use OpenAI embedding via OpenAI, Azure, or OpenRouter. By default we use OpenAI directly and the AZURE fields can be kept blank.
@@ -89,10 +96,28 @@ export const EMBEDDING_PROVIDER = EmbeddingProviderSchema.parse(process.env.EMBE
 // export const KV_REST_API_READ_ONLY_TOKEN = process.env.KV_REST_API_READ_ONLY_TOKEN || '';
 
 // Support Servers
+//
+// Inference, graph and NLA hosts live in the ComputeHost table, not here --
+// register a local one with `make host-add`. Only their shared secrets are
+// config. Autointerp and sparsity are still single-server env vars.
+
 // Inference Server
-export const USE_LOCALHOST_INFERENCE = process.env.USE_LOCALHOST_INFERENCE === 'true';
+// For local development: send all inference to one server and skip the ComputeHost table.
+// Ignored when NODE_ENV is production.
+export const USE_LOCALHOST_INFERENCE =
+  process.env.USE_LOCALHOST_INFERENCE === 'true' && process.env.NODE_ENV !== 'production';
+export const LOCALHOST_INFERENCE_HOST = process.env.LOCALHOST_INFERENCE_HOST_OVERRIDE || 'http://127.0.0.1:5002';
+// Per-model inference hosts that replace the ComputeHost table, also in
+// production: "modelId=https://host,modelId2=https://host2".
+export const INFERENCE_HOST_OVERRIDES: Record<string, string> = Object.fromEntries(
+  (process.env.INFERENCE_HOST_OVERRIDES || '')
+    .split(',')
+    .filter((entry) => entry.includes('='))
+    .map((entry) => [entry.slice(0, entry.indexOf('=')).trim(), entry.slice(entry.indexOf('=') + 1).trim()])
+    .filter(([modelId, url]) => modelId && url)
+    .map(([modelId, url]) => [modelId, url.replace(/\/+$/, '')]),
+);
 export const INFERENCE_SERVER_SECRET = process.env.INFERENCE_SERVER_SECRET || '';
-export const INFERENCE_RUNPOD_API_KEY = process.env.INFERENCE_RUNPOD_API_KEY || '';
 
 export const NEXT_PUBLIC_SEARCH_TOPK_MAX_CHAR_LENGTH = process.env.NEXT_PUBLIC_SEARCH_TOPK_MAX_CHAR_LENGTH
   ? parseInt(process.env.NEXT_PUBLIC_SEARCH_TOPK_MAX_CHAR_LENGTH, 10)
@@ -104,9 +129,6 @@ export const AUTOINTERP_SERVER = process.env.AUTOINTERP_SERVER || '';
 export const AUTOINTERP_SERVER_SECRET = process.env.AUTOINTERP_SERVER_SECRET || '';
 
 // Graph Server
-// If USE_LOCALHOST_GRAPH is true, it will always use the localhost graph server.
-// Else it will check for the server in GraphHostSource table, and use the Runpod server if it exists, otherwise use the regular hostUrl.
-export const USE_LOCALHOST_GRAPH = process.env.USE_LOCALHOST_GRAPH === 'true';
 export const GRAPH_SERVER_SECRET = process.env.GRAPH_SERVER_SECRET || '';
 
 // Sparsity Server
@@ -115,19 +137,7 @@ export const SPARSITY_SERVER = process.env.SPARSITY_SERVER || 'http://localhost:
 export const SPARSITY_SERVER_SECRET = process.env.SPARSITY_SERVER_SECRET || '';
 
 // NLA Server
-export const USE_LOCALHOST_NLA = process.env.USE_LOCALHOST_NLA === 'true';
 export const NLA_SERVER_SECRET = process.env.NLA_SERVER_SECRET || '';
-
-// Activations Server
-export const ACTIVATIONS_SERVER = process.env.ACTIVATIONS_SERVER || 'http://localhost:5010';
-export const ACTIVATIONS_SERVER_SECRET = process.env.ACTIVATIONS_SERVER_SECRET || '';
-
-// Runpod Graph
-// export const USE_RUNPOD_GRAPH = process.env.USE_RUNPOD_GRAPH === 'true';
-// if (USE_RUNPOD_GRAPH && USE_LOCALHOST_GRAPH) {
-//   throw new Error('USE_LOCALHOST_GRAPH and USE_RUNPOD_GRAPH cannot both be true.');
-// }
-export const GRAPH_RUNPOD_SECRET = process.env.GRAPH_RUNPOD_SECRET || '';
 
 // Authentication Methods
 // Apple
@@ -140,6 +150,15 @@ export const GITHUB_SECRET = process.env.GITHUB_SECRET || '';
 export const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 export const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
 
+// Cloudflare Turnstile - bot check on email sign-in. It is on only when both keys are set.
+export const CLOUDFLARE_TURNSTILE_SITEKEY = process.env.CLOUDFLARE_TURNSTILE_SITEKEY || '';
+export const CLOUDFLARE_TURNSTILE_SECRETKEY = process.env.CLOUDFLARE_TURNSTILE_SECRETKEY || '';
+export const TURNSTILE_ENABLED = CLOUDFLARE_TURNSTILE_SITEKEY !== '' && CLOUDFLARE_TURNSTILE_SECRETKEY !== '';
+
+// Maximum sign-in emails for the whole site in 24 hours. At the cap, email sign-in stops and admins get an alert.
+const signInEmailsPerDay = parseInt(process.env.SIGN_IN_EMAILS_PER_DAY || '', 10);
+export const SIGN_IN_EMAILS_PER_DAY = Number.isNaN(signInEmailsPerDay) ? 1000 : signInEmailsPerDay;
+
 // Authentication Refresh - for updating the Apple Client Secret every 6 months (using ./node scripts/apple-gen-secret.js and .secret.apple.p8)
 // export const APPLE_KEY_ID = process.env.APPLE_KEY_ID || '';
 // export const APPLE_TEAM_ID = process.env.APPLE_TEAM_ID || '';
@@ -149,9 +168,13 @@ export const IS_ACTUALLY_NEURONPEDIA_ORG =
   process.env.NEXT_PUBLIC_URL === 'https://neuronpedia.org' ||
   process.env.NEXT_PUBLIC_URL === 'https://www.neuronpedia.org';
 
+// Which deployment this webapp is. A registering compute host states which
+// deployment it means to join, and registration fails if the two disagree, so
+// a pod aimed at the wrong webapp cannot quietly start taking its traffic.
+export const NEURONPEDIA_ENVIRONMENT = process.env.NEURONPEDIA_ENVIRONMENT || 'dev';
+
 // Misc
 export const NODE_ENV = process.env.NODE_ENV || '';
-export const IS_DOCKER_COMPOSE = process.env.IS_DOCKER_COMPOSE === 'true';
 export const DEMO_MODE = process.env.NEXT_PUBLIC_DEMO_MODE === 'true' || IS_ONE_CLICK_VERCEL_DEPLOY;
 export const ASSET_BASE_URL = 'https://neuronpedia.s3.us-east-1.amazonaws.com/site-assets';
 export const GRAPH_ADMIN_BROWSE_KEY = process.env.GRAPH_ADMIN_BROWSE_KEY || '';

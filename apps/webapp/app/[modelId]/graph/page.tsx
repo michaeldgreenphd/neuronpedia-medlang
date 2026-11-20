@@ -4,7 +4,7 @@ import { GraphStateProvider } from '@/components/provider/graph-state-provider';
 import { prisma } from '@/lib/db';
 import { getModelById } from '@/lib/db/model';
 import { ASSET_BASE_URL } from '@/lib/env';
-import { ModelWithPartialRelations } from '@/prisma/generated/zod';
+import { GraphMetadataWithPartialRelations, ModelWithPartialRelations } from '@/prisma/generated/zod';
 import { Metadata } from 'next';
 import { getServerSession } from 'next-auth/next';
 import { notFound } from 'next/navigation';
@@ -20,12 +20,10 @@ import {
 } from './utils';
 import GraphWrapper from './wrapper';
 
-export async function generateMetadata(
-  props: {
-    params: Promise<{ modelId: string }>;
-    searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
-  }
-): Promise<Metadata> {
+export async function generateMetadata(props: {
+  params: Promise<{ modelId: string }>;
+  searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
+}): Promise<Metadata> {
   const searchParams = await props.searchParams;
   const params = await props.params;
   const { modelId } = params;
@@ -81,18 +79,39 @@ function mergeGraphMetadataArrays(map: ModelToGraphMetadatasMap, modelId: string
   }
 }
 
+// Include the owner name and the newest featured solution. The graph provider
+// applies that solution as the default subgraph when a graph is selected.
+const GRAPH_METADATA_INCLUDE = {
+  user: {
+    select: {
+      name: true,
+    },
+  },
+  subgraphs: {
+    where: { isFeaturedSolution: true },
+    orderBy: { createdAt: 'desc' as const },
+    take: 1,
+  },
+};
+
 // Helper function to get graph metadata with user info
 async function getGraphMetadataWithUser(where: any) {
   return prisma.graphMetadata.findMany({
     where,
-    include: {
-      user: {
-        select: {
-          name: true,
-        },
-      },
-    },
+    include: GRAPH_METADATA_INCLUDE,
   });
+}
+
+// Look up one graph by model and slug. Returns undefined when it does not exist.
+async function findGraphMetadata(
+  modelId: string,
+  slug: string,
+): Promise<GraphMetadataWithPartialRelations | undefined> {
+  const graphMetadata = await prisma.graphMetadata.findUnique({
+    where: { modelId_slug: { modelId, slug } },
+    include: GRAPH_METADATA_INCLUDE,
+  });
+  return (graphMetadata as GraphMetadataWithPartialRelations | null) ?? undefined;
 }
 
 async function getFeaturedGraphs() {
@@ -100,35 +119,27 @@ async function getFeaturedGraphs() {
     where: {
       isFeatured: true,
     },
-    include: {
-      user: {
-        select: {
-          name: true,
-        },
-      },
-    },
+    include: GRAPH_METADATA_INCLUDE,
   });
   return featuredGraphs;
 }
 
-export default async function Page(
-  props: {
-    params: Promise<{ modelId: string }>;
-    searchParams: Promise<{
-      logitDiff?: string;
-      slug?: string;
-      pinnedIds?: string;
-      supernodes?: string;
-      clerps?: string;
-      pruningThreshold?: string;
-      densityThreshold?: string;
-      embed?: string;
-      subgraph?: string;
-      generate?: string;
-      sourceSet?: string;
-    }>;
-  }
-) {
+export default async function Page(props: {
+  params: Promise<{ modelId: string }>;
+  searchParams: Promise<{
+    logitDiff?: string;
+    slug?: string;
+    pinnedIds?: string;
+    supernodes?: string;
+    clerps?: string;
+    pruningThreshold?: string;
+    densityThreshold?: string;
+    embed?: string;
+    subgraph?: string;
+    generate?: string;
+    sourceSet?: string;
+  }>;
+}) {
   const searchParams = await props.searchParams;
   const params = await props.params;
   const { modelId } = params;
@@ -190,7 +201,7 @@ export default async function Page(
   });
 
   // set the metadata graph to show, if specified in the url. if we don't have it, look it up in the database
-  let metadataGraph;
+  let metadataGraph: GraphMetadataWithPartialRelations | undefined;
   let parsedSupernodes: string[][] | undefined;
   let parsedClerps: string[][] | undefined;
   let pinnedIds: string | undefined;
@@ -201,27 +212,12 @@ export default async function Page(
     metadataGraph = modelIdToGraphMetadatasMap[modelId]?.find((graph) => graph.slug === searchParams.slug);
     // if it's not in our map, look it up in the database
     if (!metadataGraph) {
-      metadataGraph = await prisma.graphMetadata.findUnique({
-        where: {
-          modelId_slug: {
-            modelId,
-            slug: searchParams.slug,
-          },
-        },
-        include: {
-          user: {
-            select: {
-              name: true,
-            },
-          },
-        },
-      });
+      metadataGraph = await findGraphMetadata(modelId, searchParams.slug);
       // add this to our map
       if (metadataGraph) {
         addGraphMetadataToMap(modelIdToGraphMetadatasMap, modelId, metadataGraph);
       } else {
         console.error(`Graph with slug ${searchParams.slug} not found in database`);
-        metadataGraph = undefined;
       }
     }
 
@@ -269,36 +265,27 @@ export default async function Page(
     }
   } else {
     // No slug specified - pick a default graph
-    if (modelId === 'gemma-2-2b' && modelIdToGraphMetadatasMap['gemma-2-2b']) {
+    if (modelId === 'gemma-2-2b' && initialSourceSet === 'clt-hp') {
+      const cltSlug = 'factthecapitalof-1789506352829';
+      metadataGraph = modelIdToGraphMetadatasMap['gemma-2-2b']?.find((graph) => graph.slug === cltSlug);
+      if (!metadataGraph) {
+        metadataGraph = await findGraphMetadata(modelId, cltSlug);
+        if (metadataGraph) {
+          addGraphMetadataToMap(modelIdToGraphMetadatasMap, modelId, metadataGraph);
+        }
+      }
+    } else if (modelId === 'gemma-2-2b' && modelIdToGraphMetadatasMap['gemma-2-2b']) {
+      // The default subgraph for this graph is its featured solution in the database.
       metadataGraph = modelIdToGraphMetadatasMap['gemma-2-2b'].find(
         (graph) => graph.slug === 'gemma-fact-dallas-austin',
       );
-      if (metadataGraph) {
-        pinnedIds =
-          '27_22605_10,20_15589_10,E_26865_9,21_5943_10,23_12237_10,20_15589_9,16_25_9,14_2268_9,18_8959_10,4_13154_9,7_6861_9,19_1445_10,E_2329_7,E_6037_4,0_13727_7,6_4012_7,17_7178_10,15_4494_4,6_4662_4,4_7671_4,3_13984_4,1_1000_4,19_7477_9,18_6101_10,16_4298_10,7_691_10';
-        parsedSupernodes = [
-          ['capital', '15_4494_4', '6_4662_4', '4_7671_4', '3_13984_4', '1_1000_4'],
-          ['state', '6_4012_7', '0_13727_7'],
-          ['Texas', '20_15589_9', '19_7477_9', '16_25_9', '4_13154_9', '14_2268_9', '7_6861_9'],
-          ['preposition followed by place name', '19_1445_10', '18_6101_10'],
-          ['capital cities/say a capital city', '21_5943_10', '17_7178_10', '7_691_10', '16_4298_10'],
-        ];
-        parsedClerps = [
-          ['23_2312237_10', 'Cities and states names (say Austin)'],
-          ['18_1808959_10', 'state/regional government'],
-        ];
-        pruningThreshold = 0.6;
-        densityThreshold = 0.99;
-      }
     }
 
     // If no graph selected yet, try the first featured graph for this model
     if (!metadataGraph) {
       const featuredForModel = featuredGraphs.find((g) => g.modelId === modelId);
       if (featuredForModel) {
-        metadataGraph = modelIdToGraphMetadatasMap[modelId]?.find(
-          (graph) => graph.slug === featuredForModel.slug,
-        );
+        metadataGraph = modelIdToGraphMetadatasMap[modelId]?.find((graph) => graph.slug === featuredForModel.slug);
       }
     }
 

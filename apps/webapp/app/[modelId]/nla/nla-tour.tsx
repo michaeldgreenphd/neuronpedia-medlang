@@ -2,8 +2,9 @@
 
 import { driver, type DriveStep } from 'driver.js';
 import 'driver.js/dist/driver.css';
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 // Loaded after driver.css so our theme overrides win on equal specificity.
+import { runWhenIdle } from '@/lib/utils/run-when-idle';
 import {
   NLA_DETAILS_ELEMENT_ID,
   NLA_TOUR_FINISH_CACHE_ID,
@@ -412,6 +413,11 @@ export function useNlaTour(options: NlaTourOptions) {
   const optionsRef = useRef(options);
   optionsRef.current = options;
 
+  // Whether the main tour is currently running. Consumers use this to give
+  // the chat panel more vertical space on mobile while the tour is active
+  // (the tour's early steps center on the chat conversation).
+  const [isTourActive, setIsTourActive] = useState(false);
+
   useEffect(
     () => () => {
       driverRef.current?.destroy();
@@ -471,10 +477,16 @@ export function useNlaTour(options: NlaTourOptions) {
       },
     });
     driverRef.current = hint;
-    hint.drive();
+    // Defer the drive until the browser is idle so driver.js doesn't mount its
+    // overlay onto <body> while React is still committing the wrap-up navigation
+    // that spawned this hint — that race crashes on mobile (see runWhenIdle).
+    runWhenIdle(() => {
+      if (driverRef.current !== hint) return;
+      hint.drive();
+    });
   }, [navigateToFinishState]);
 
-  return useCallback(() => {
+  const startTour = useCallback(() => {
     driverRef.current?.destroy();
     // Force the page onto the model that owns the demo conversation used
     // in step 2. `handleModelChange` is a soft (history.replaceState)
@@ -535,6 +547,7 @@ export function useNlaTour(options: NlaTourOptions) {
       onDestroyed: () => {
         clearStepCleanup();
         clearAvDoneWatcher();
+        setIsTourActive(false);
         // Make sure the tour-only highlight range never persists after
         // the user closes the tour mid-step 5.
         optionsRef.current.setHighlightedRange(null);
@@ -555,6 +568,18 @@ export function useNlaTour(options: NlaTourOptions) {
       },
     });
     driverRef.current = instance;
-    instance.drive();
+    setIsTourActive(true);
+    // Defer the drive until the browser is idle. `drive()` mounts driver.js's
+    // overlay/popover onto `document.body`; running it synchronously here races
+    // React's commit of the soft model-swap (`handleModelChange`) + cache
+    // hydrate (`loadCacheById`) kicked off just above, which crashes on mobile
+    // (see runWhenIdle). Step 1 is a centered popover (no target element), so no
+    // element needs to be awaited first.
+    runWhenIdle(() => {
+      if (driverRef.current !== instance) return;
+      instance.drive();
+    });
   }, [showGuideHighlight, navigateToFinishState]);
+
+  return { startTour, isTourActive };
 }

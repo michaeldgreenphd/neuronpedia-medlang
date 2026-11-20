@@ -1,6 +1,6 @@
 #### neuronpedia 🧠🔍 graph server
 
-This is the attribution graph generation server. It supports two backends:
+This is the attribution graph generation server. `--attribution-engine` selects which algorithm builds the graph:
 
 1. **circuit-tracer** (default) - Based on [circuit-tracer](https://github.com/safety-research/circuit-tracer) by Piotrowski & Hanna. Decomposes MLP layers using transcoders/CLTs.
 2. **lm-saes-crm** - Based on [Language-Model-SAEs](https://github.com/OpenMOSS/Language-Model-SAEs) by OpenMOSS. Uses Complete Replacement Models (CRM) that decompose both MLP layers (transcoders) and attention layers (Lorsa), producing richer graphs with attention-circuit features.
@@ -14,20 +14,20 @@ This is the attribution graph generation server. It supports two backends:
 - [Example Request - CRM Graph with Lorsa Features](#example-request---crm-graph-with-lorsa-features)
 - [Example Request - Output Graph JSON to S3 with presigned URL](#example-request---output-graph-json-to-s3-with-presigned-url)
 - [Example Request - Steering (Interventions) With Top Logits](#example-request---steering-interventions-with-top-logits)
-- [Runpod Serverless](#runpod-serverless)
-
 ### Install
 
 ```
 # Navigate to the graph app directory
 cd apps/graph
 
-# Install dependencies using Poetry (circuit-tracer backend only)
-poetry install
+# Install for the circuit-tracer attribution engine (the default)
+uv sync --extra circuit-tracer
 
-# Install with CRM backend support (includes lm-saes and its dependencies)
-poetry install --extras crm
+# Install for the CRM attribution engine (adds lm-saes/llamascopium and its dependencies)
+uv sync --extra crm
 ```
+
+Each attribution engine's dependencies are an opt-in extra, and you need one of them — a bare `uv sync` installs the server but neither attribution library. The two extras are independent because the two engines share no code: `--attribution-engine circuit-tracer` imports no `llamascopium`, and `--attribution-engine lm-saes-crm` imports no `circuit_tracer`. Installing both at once (`--extra circuit-tracer --extra crm`) works and is what the parity tests use.
 
 ### Config
 
@@ -44,35 +44,45 @@ Create an `.env` file with `SECRET` and `HF_TOKEN` (see `.env.example`)
 # Only run one of the following, depending on which model you want to run.
 
 # Run with Gemma-2-2B model with the Gemmascope transcoders
-poetry run python start.py --model_id google/gemma-2-2b --transcoder_set gemma
+uv run python start.py --model_id google/gemma-2-2b --transcoder_set gemma
 
 # Run with Qwen3-4B model with transcoders trained by Anthropic Fellows
-poetry run python start.py --model_id Qwen/Qwen3-4B --transcoder_set mwhanna/qwen3-4b-transcoders
+uv run python start.py --model_id Qwen/Qwen3-4B --transcoder_set mwhanna/qwen3-4b-transcoders
 
 # Run with Gemma-2-2B model with CLTs trained by Anthropic Fellows
-poetry run python start.py --model_id google/gemma-2-2b --transcoder_set mntss/clt-gemma-2-2b-2.5M
+uv run python start.py --model_id google/gemma-2-2b --transcoder_set mntss/clt-gemma-2-2b-2.5M
 ```
+
+#### Disk and memory
+
+Transcoder sets are downloaded in full before the server starts, and they are much larger than the models: `mwhanna/qwen3-4b-transcoders` is 57 GiB and `mntss/clt-gemma-2-2b-2.5M` is 160 GiB, so budget disk accordingly (the pod definitions give those two 250 GB).
+
+Decoder weights are loaded lazily by default, sliced out of those files on demand rather than held on the GPU. **Encoders are not**: `--lazy-encoder` does the same for them and is off by default, so on a wide set the resident encoders, not the model, are what fills the card. Per layer they are `width × d_model × 2` bytes, which is 0.78 GiB for `mwhanna/qwen3-4b-transcoders` (28 GiB over 36 layers) and 1.25 GiB for `mwhanna/gemma-scope-2-4b-it` at width 262k (42.5 GiB over 34 layers — more than a 48 GiB card holds, so that set needs the flag to start at all). With it on, measured on a 32 GiB card, qwen3-4b idles at 8.9 GiB and the 2.5M CLT at 6.3 GiB.
+
+Neither flag reduces the download, only residency. Both are force-disabled with a warning for sets whose config declares `special_load_fn: gemma-scope-2`, whose key names the lazy path cannot read; to get lazy loading there, pre-cache with `circuit_tracer.utils.caching.save_transcoders_to_cache`. Note that this is a property of the config, not of the repo name — `mwhanna/gemma-scope-2-4b-it` declares no `special_load_fn`, so it loads through the generic path and honours both flags.
+
+Peak memory is driven by the attribution's backward pass, not by what is resident, so the safe `batch_size` does not follow model size: on that same card qwen3-4b handles 48 but OOMs at 128 on a single 24.9 GiB allocation, while the much wider CLT is comfortable at 256.
 
 ### Start Server - CRM Backend (Lorsa + Transcoders)
 
 The Complete Replacement Model (CRM) backend uses [lm-saes](https://github.com/OpenMOSS/Language-Model-SAEs) to generate graphs. These graphs include both transcoder features (MLP decomposition) and Lorsa features (attention decomposition), enabling complete circuit tracing as described in [Bridging the Attention Gap](https://interp.open-moss.com/posts/complete-replacement).
 
-Requires `poetry install --extras crm` first.
+Requires `uv sync --extra crm` first.
 
 Available checkpoints are hosted at [OpenMOSS-Team/Llama-Scope-2-Qwen3-1.7B](https://huggingface.co/OpenMOSS-Team/Llama-Scope-2-Qwen3-1.7B) with configurations: expansion `8x` or `32x`, top-k `k64`, `k128`, or `k256`.
 
 ```
 # Qwen3-1.7B with 8x expansion, K=64 (smallest, fastest - good for testing)
-poetry run python start.py \
-  --backend lm-saes-crm \
+uv run python start.py \
+  --attribution-engine lm-saes-crm \
   --model_id Qwen/Qwen3-1.7B \
   --sae_repo OpenMOSS-Team/Llama-Scope-2-Qwen3-1.7B \
   --sae_expansion 8x \
   --sae_topk k64
 
 # Qwen3-1.7B with 8x expansion, K=128 (higher quality graphs)
-poetry run python start.py \
-  --backend lm-saes-crm \
+uv run python start.py \
+  --attribution-engine lm-saes-crm \
   --model_id Qwen/Qwen3-1.7B \
   --sae_repo OpenMOSS-Team/Llama-Scope-2-Qwen3-1.7B \
   --sae_expansion 8x \
@@ -80,6 +90,42 @@ poetry run python start.py \
 ```
 
 This loads 28 transcoder modules + 28 Lorsa modules (one per layer). The 8x/k64 config requires ~24GB VRAM; 32x configs require ~40GB+.
+
+#### Model engine
+
+`--model-engine` chooses what *executes* the model. It applies to either attribution engine and changes nothing about what the graph contains — only which architectures are reachable. `--attribution-engine`, by contrast, picks the algorithm and so decides the graph's contents. The two are independent:
+
+- `interp_engine` (default) uses [`interp-engine`](https://github.com/decoderesearch/interp-engine) to hook a HuggingFace `AutoModelForCausalLM` in place, so it reaches any model `transformers` can load. Several tensors the attribution needs are not module boundaries on a HuggingFace model and are reconstructed instead; see `neuronpedia_graph/crm_interp_engine.py`.
+- `transformerlens` converts the weights into TransformerLens' convention, so it only reaches architectures TransformerLens has a conversion for.
+- `nnsight` is available for `circuit-tracer` only. llamascopium's attribution reaches the model through methods nnsight's proxies do not provide, so the CRM engine rejects it with an explicit error.
+
+Values keep underscores (`interp_engine`, not `interp-engine`) because they are passed straight through to circuit-tracer's own `backend=` literal.
+
+One endpoint is narrower than the rest: [`/steer`](#example-request---steering-interventions-with-top-logits) generates on `interp_engine` only, and refuses the other two with an error naming what the pod loaded. Its sampling parameters (`temperature`, `freq_penalty`) are TransformerLens', which `neuronpedia_graph/steer_generation.py` translates into `transformers`' terms; carrying a second spelling of them for engines no pod runs bought nothing. Graph generation is unaffected on every engine.
+
+Under CRM both options run llamascopium's attribution itself, unmodified.
+
+The two agree to a few parts per million on the adjacency matrix in `float32`, and select the same graph nodes, QK tracing included (`tests/test_crm_backend_parity.py`, opt in with `RUN_CRM_PARITY=1`) — which is what makes `interp_engine` the default. In `bfloat16` this attribution is not reproducible to better than ~0.3 relative *within* a single backend, so compare in `float32` if you are checking a change.
+
+One case still needs `transformerlens`: QK tracing attributes to the model's output-projection biases as graph leaves, and `interp_engine` can only expose the replacement modules' own biases. On an architecture whose attention or MLP output projection carries a bias it refuses with an error naming the layers, rather than quietly dropping those source nodes.
+
+The split falls along the GPT-2-to-Llama transition, since Llama dropped biases and everything after it followed. Surveyed with the same lookup the check uses:
+
+| affected (QK tracing refuses) | unaffected |
+| --- | --- |
+| GPT-2, GPT-NeoX / Pythia, Starcoder2, GPT-J (MLP bias only) | Llama, Qwen2, Qwen3, Gemma 2, Gemma 3, Mistral, Phi-3, StableLM 2 |
+
+This is currently theoretical: CRM needs Lorsa + transcoder checkpoints, and the only published set is [Llama-Scope-2 for Qwen3-1.7B](https://huggingface.co/OpenMOSS-Team/Llama-Scope-2-Qwen3-1.7B), which is unaffected. No affected architecture has CRM weights to run in the first place. Separately, OPT, BLOOM, Falcon and Phi-2 cannot use this backend at all — interp-engine has no attention/MLP resolution for them, so it fails at load with an explicit error rather than at QK tracing.
+
+```
+uv run python start.py \
+  --attribution-engine lm-saes-crm \
+  --model-engine transformerlens \
+  --model_id Qwen/Qwen3-1.7B \
+  --sae_repo OpenMOSS-Team/Llama-Scope-2-Qwen3-1.7B \
+  --sae_expansion 8x \
+  --sae_topk k64
+```
 
 ### Example Request - Output Graph JSON Directly
 
@@ -108,7 +154,7 @@ curl -X POST http://localhost:5004/generate-graph \
 
 This generates a Complete Replacement Model (CRM) attribution graph for an acronym completion prompt on Qwen3-1.7B. The output includes both `cross layer transcoder` nodes (MLP features) and `lorsa` nodes (attention features).
 
-Start the server with `--backend lm-saes-crm` first (see above).
+Start the server with `--attribution-engine lm-saes-crm` first (see above).
 
 ```
 curl -X POST http://localhost:5004/generate-graph \
@@ -395,8 +441,18 @@ FastAPI has a built-in docs + endpoint tester. After running the server, to see 
 
 Notes/Caveats:
 
-- If you set a SECRET (not set by default) in your `.env` file, you'll need to add a `x-secret-key` header.
+- The `x-secret-key` header is required on every path, `/docs` and `/health` included.
 
-### Runpod Serverless
+## Health check
 
-The `apps/graph/runpod` directory contains a [Runpod Serverless](https://docs.runpod.io/serverless/overview) worker that does the same as `apps/graph` - it just in a format the Runpod expects. It has its own `README.md`.
+`GET /health` is for monitors. It runs one token through the loaded model under the same lock the GPU handlers take, so a 200 means a request would work right now.
+
+- 200 `"status": "ok"`: the forward pass ran; `probe_ms` is its wall time.
+- 200 `"status": "busy"`: a graph is being generated, so the probe stood aside; `busy_seconds` says for how long.
+- 503 `"status": "unhealthy"`: the probe failed (`error` says how), it did not finish in `HEALTH_PROBE_TIMEOUT` seconds (default 20), or one request has held the server longer than `HEALTH_BUSY_LIMIT` seconds (default 1200).
+
+The body also lists per-GPU free and total memory.
+
+```bash
+curl -H "x-secret-key: $SECRET" http://localhost:5004/health
+```

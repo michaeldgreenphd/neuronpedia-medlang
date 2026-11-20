@@ -14,10 +14,81 @@ export const DELIMITER_BETWEEN_SOURCESET_AND_ADDITIONAL_INFO = '__';
 
 export const EMBED_LAYER_STRING = 'e'; // embed for pythia-70m-deduped is "e-res-sm"
 export const NEURONS_SOURCESET = 'neurons';
+// The release that holds the neurons source set of each model. Its page is /neurons.
+export const NEURONS_RELEASE = 'neurons';
 
 export function isNeuronLayerSource(source: string) {
   // this just means if it's an integer
   return /^-?\d+$/.test(source);
+}
+
+// A neuron page with no Neuron row must be inside the model. A count of 0 means it is not known.
+// Only the plain form passes ("7", not "07" or "-0"), so each neuron has one URL.
+export function isNeuronInModelRange(
+  model: { layers?: number | null; neuronsPerLayer?: number | null },
+  layer: string,
+  index: string,
+) {
+  const layerNum = Number(layer);
+  const indexNum = Number(index);
+  if (!/^\d+$/.test(layer) || !/^\d+$/.test(index) || String(layerNum) !== layer || String(indexNum) !== index) {
+    return false;
+  }
+  if (model.layers && layerNum >= model.layers) {
+    return false;
+  }
+  if (model.neuronsPerLayer && indexNum >= model.neuronsPerLayer) {
+    return false;
+  }
+  return true;
+}
+
+// Neuron steering is on only for neuron layers with file dashboards (SourceSet.externalDashboardsUrl)
+// and inference. Older neuron sets have no pod that steers neurons.
+export function isSteerableNeuronLayer(
+  sourceSet: { name?: string | null; externalDashboardsUrl?: string | null } | undefined,
+  source: { id?: string | null; inferenceEnabled?: boolean | null } | undefined,
+) {
+  return Boolean(
+    sourceSet?.name === NEURONS_SOURCESET &&
+    sourceSet.externalDashboardsUrl &&
+    source?.inferenceEnabled &&
+    isNeuronLayerSource(source.id || ''),
+  );
+}
+
+// ICA Lens source sets are named "icalens-<hook>", e.g. "icalens-res".
+export const ICALENS_SOURCESET_PREFIX = 'icalens-';
+
+// Neurons and ICA Lens components fire on about half of all tokens, so a density filter hides all of them.
+export function sourceSetIgnoresDensity(sourceSetName: string) {
+  return sourceSetName === NEURONS_SOURCESET || sourceSetName.startsWith(ICALENS_SOURCESET_PREFIX);
+}
+
+// For release filters. The neurons release holds every neurons source set, even one with no releaseName.
+export function isSourceSetInRelease(
+  sourceSet: { name?: string | null; releaseName?: string | null } | undefined,
+  releaseName: string,
+) {
+  if (releaseName === NEURONS_RELEASE) {
+    return sourceSet?.name === NEURONS_SOURCESET;
+  }
+  return sourceSet?.releaseName === releaseName;
+}
+
+// On a model change from a neurons source set, stay on neurons if the new model has neuron layers to offer.
+export function keepNeuronsOnModelChange(currentSourceSet: string, newModelNeuronLayers: string[]) {
+  return currentSourceSet === NEURONS_SOURCESET && newModelNeuronLayers.length > 0;
+}
+
+// For the source dropdown, eg "Neurons Layer 6"
+export function getNeuronLayerLabel(layer: string) {
+  return `Neurons Layer ${layer}`;
+}
+
+// For breadcrumbs, eg "MLP Neurons - Layer 6"
+export function getNeuronLayerTitle(layer: string) {
+  return `MLP Neurons - Layer ${layer}`;
 }
 
 export function getLayerNumFromSource(source: string) {
@@ -233,4 +304,30 @@ export function getFirstSourceForModel(
         return true;
       }) || undefined
   );
+}
+
+// The source set a picker starts on: the model's defaultSourceSetName, else its neurons, else the first by name.
+// Neurons ignore publicOnly, like the neurons item in the source dropdown.
+export function getDefaultSourceSetForModel(model: ModelWithPartialRelations | undefined, publicOnly = false) {
+  const sourceSets = (model?.sourceSets || []).filter((ss) => ss.hasDashboards);
+  const listed = sourceSets.filter((ss) => !publicOnly || ss.visibility === Visibility.PUBLIC);
+  return (
+    listed.find((ss) => ss.name === model?.defaultSourceSetName) ||
+    sourceSets.find((ss) => ss.name === NEURONS_SOURCESET) ||
+    listed.toSorted((a, b) => (a.name || '').localeCompare(b.name || ''))[0]
+  );
+}
+
+// The model's defaultSourceId when it is in the default source set, else that set's first source in natural order
+export function getDefaultSourceForModel(model: ModelWithPartialRelations | undefined, publicOnly = false) {
+  const sources = (getDefaultSourceSetForModel(model, publicOnly)?.sources || []).filter((s) => s.hasDashboards);
+  return (
+    sources.find((s) => s.id === model?.defaultSourceId) ||
+    sources.toSorted((a, b) => (a.id || '').localeCompare(b.id || '', undefined, { numeric: true }))[0]
+  );
+}
+
+// True when the source has a SAELens config, a Hugging Face folder, or SAELens load ids to show.
+export function saeHasConfig(sae: SourceWithPartialRelations) {
+  return Boolean(sae.saelensConfig || (sae.hfRepoId && sae.hfFolderId) || (sae.saelensSaeId && sae.saelensRelease));
 }

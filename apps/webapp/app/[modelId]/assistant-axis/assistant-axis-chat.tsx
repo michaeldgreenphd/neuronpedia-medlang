@@ -6,8 +6,10 @@ import { Button } from '@/components/shadcn/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/shadcn/dialog';
 import SteerChatMessage from '@/components/steer/chat-message';
 import { LoadingSquare } from '@/components/svg/loading-square';
+import { NPSteerMethod, NPSteerType } from '@/lib/api/inference-types';
 import { ASSET_BASE_URL, IS_ACTUALLY_NEURONPEDIA_ORG } from '@/lib/env';
 import { ChatMessage, ERROR_STEER_MAX_PROMPT_CHARS, SteerFeature } from '@/lib/utils/steer';
+import { PublicAxisReadout } from '@/lib/utils/steer-axis-public';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { ArrowRightIcon, InfoCircledIcon, QuestionMarkCircledIcon } from '@radix-ui/react-icons';
 import copy from 'copy-to-clipboard';
@@ -26,15 +28,20 @@ import {
   Undo2,
   X,
 } from 'lucide-react';
-import { NPSteerMethod, SteerCompletionChatPost200ResponseAssistantAxisInner } from 'neuronpedia-inference-client';
 import Link from 'next/link';
 import { MutableRefObject, useEffect, useRef, useState } from 'react';
 import ReactTextareaAutosize from 'react-textarea-autosize';
 import AssistantAxisWelcomeModal from './assistant-axis-welcome-modal';
 import PersonaChart, { ChartData } from './persona-chart';
-import { CAP_BLOG_URL, CAP_CONTACT_EMAIL, CAP_GITHUB_URL, CAP_PAPER_URL, CAP_VECTOR_URL, DEMO_BUTTONS } from './shared';
-
-type PersonaCheckResult = SteerCompletionChatPost200ResponseAssistantAxisInner;
+import {
+  assistantAxisFor,
+  CAP_BLOG_URL,
+  CAP_CONTACT_EMAIL,
+  CAP_GITHUB_URL,
+  CAP_PAPER_URL,
+  CAP_VECTOR_URL,
+  DEMO_BUTTONS,
+} from './shared';
 
 export default function AssistantAxisChat({
   isSteering,
@@ -51,7 +58,7 @@ export default function AssistantAxisChat({
   setUrl,
   temperature,
   steerTokens,
-  freqPenalty,
+  presencePenalty,
   randomSeed,
   seed,
   strMultiple,
@@ -86,14 +93,14 @@ export default function AssistantAxisChat({
   setUrl: (url: string) => void;
   temperature: number;
   steerTokens: number;
-  freqPenalty: number;
+  presencePenalty: number;
   randomSeed: boolean;
   seed: number;
   strMultiple: number;
   steerSpecialTokens: boolean;
   steerMethod: NPSteerMethod;
   scrollToTurnIndex?: number | null;
-  onAssistantAxisData?: (steeredData: PersonaCheckResult | null, defaultData: PersonaCheckResult | null) => void;
+  onAssistantAxisData?: (steeredData: PublicAxisReadout | null, defaultData: PublicAxisReadout | null) => void;
   currentSavedId: string | null;
   loadSavedSteerOutput: (steerOutputId: string) => void;
   chartData: ChartData | null;
@@ -104,8 +111,8 @@ export default function AssistantAxisChat({
   setChartData: (chartData: ChartData | null) => void;
   usePostCap: boolean;
   setUsePostCap: (usePostCap: boolean) => void;
-  rawSteeredAxis: PersonaCheckResult | null;
-  rawDefaultAxis: PersonaCheckResult | null;
+  rawSteeredAxis: PublicAxisReadout | null;
+  rawDefaultAxis: PublicAxisReadout | null;
 }) {
   const normalEndRef = useRef<HTMLDivElement | null>(null);
   const steeredEndRef = useRef<HTMLDivElement | null>(null);
@@ -279,7 +286,7 @@ export default function AssistantAxisChat({
           features: selectedFeatures,
           temperature,
           n_tokens: steerTokens,
-          freq_penalty: freqPenalty,
+          presence_penalty: presencePenalty,
           seed: randomSeed ? Math.floor(Math.random() * 200000000 - 100000000) : seed,
           strength_multiplier: strMultiple,
           steer_method: steerMethod,
@@ -344,9 +351,10 @@ export default function AssistantAxisChat({
           .getReader();
         readerRef.current = reader;
 
-        // Track the latest assistant_axis data from streaming chunks (one for each steer type)
-        let latestSteeredAxis: PersonaCheckResult | null = null;
-        let latestDefaultAxis: PersonaCheckResult | null = null;
+        // Track the latest reading from the streaming chunks (one for each steer type)
+        let latestSteeredAxis: PublicAxisReadout | null = null;
+        let latestDefaultAxis: PublicAxisReadout | null = null;
+        let axisApplied = false;
 
         while (true) {
           // eslint-disable-next-line
@@ -354,8 +362,9 @@ export default function AssistantAxisChat({
           if (done) {
             readerRef.current = null;
             setIsSteering(false);
-            // Pass the assistant_axis data to the parent after streaming completes
-            if (onAssistantAxisData && (latestSteeredAxis || latestDefaultAxis)) {
+            // Fallback for a run that never produced both lines (e.g. a cached default
+            // saved before cap monitoring, so it carries no axis data of its own).
+            if (onAssistantAxisData && !axisApplied && (latestSteeredAxis || latestDefaultAxis)) {
               onAssistantAxisData(latestSteeredAxis, latestDefaultAxis);
             }
             break;
@@ -370,49 +379,32 @@ export default function AssistantAxisChat({
           if (data.id) {
             setUrl(data.id);
           }
-          // Track assistant_axis data from the response (now an array with type field)
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const assistantAxisArray = (data as any).assistant_axis as PersonaCheckResult[] | undefined;
-          if (assistantAxisArray && Array.isArray(assistantAxisArray)) {
-            console.log('[DEBUG] Received assistant_axis (streaming):', JSON.stringify(assistantAxisArray, null, 2));
-            for (const axisItem of assistantAxisArray) {
-              if (axisItem.type === 'STEERED') {
-                latestSteeredAxis = axisItem;
-              } else if (axisItem.type === 'DEFAULT') {
-                latestDefaultAxis = axisItem;
-              }
-            }
+          // A frame carries every axis read so far, for whichever type produced it
+          const steered = assistantAxisFor(data.axes, NPSteerType.STEERED);
+          const notSteered = assistantAxisFor(data.axes, NPSteerType.DEFAULT);
+          if (steered) latestSteeredAxis = steered;
+          if (notSteered) latestDefaultAxis = notSteered;
+          // Both lines are plottable the moment each type has sent its axis frame. What
+          // remains on the stream is the database write and the share URL, so waiting
+          // for it to close (as this used to) held the chart still for that whole round
+          // trip even though the numbers were already here.
+          if (!axisApplied && latestSteeredAxis && latestDefaultAxis && onAssistantAxisData) {
+            axisApplied = true;
+            onAssistantAxisData(latestSteeredAxis, latestDefaultAxis);
           }
           setTypedInText('');
         }
       } else {
-        const data = await response.json();
+        const data = (await response.json()) as SteerResultChat;
         setDefaultChatMessages(data.DEFAULT?.chatTemplate || []);
         setSteeredChatMessages(data.STEERED?.chatTemplate || []);
-        setUrl(data.id);
+        setUrl(data.id ?? '');
         setTypedInText('');
         setIsSteering(false);
-        // Pass the assistant_axis data to the parent for non-streaming response
 
-        const assistantAxisArray = data.assistant_axis as PersonaCheckResult[] | undefined;
-        console.log('[DEBUG] Received assistant_axis (non-streaming):', JSON.stringify(assistantAxisArray, null, 2));
-        if (onAssistantAxisData && assistantAxisArray && Array.isArray(assistantAxisArray)) {
-          let steeredAxis: PersonaCheckResult | null = null;
-          let defaultAxis: PersonaCheckResult | null = null;
-          for (const axisItem of assistantAxisArray) {
-            // Debug: check if pcValuesPostCap exists in turns
-            const hasPostCap = axisItem.turns?.some((t) => t.pcValuesPostCap);
-            console.log(`[DEBUG] ${axisItem.type} axis - has pcValuesPostCap:`, hasPostCap);
-            if (axisItem.turns && axisItem.turns.length > 0) {
-              console.log(`[DEBUG] ${axisItem.type} first turn keys:`, Object.keys(axisItem.turns[0]));
-              console.log(`[DEBUG] ${axisItem.type} first turn pcValuesPostCap:`, axisItem.turns[0].pcValuesPostCap);
-            }
-            if (axisItem.type === 'STEERED') {
-              steeredAxis = axisItem;
-            } else if (axisItem.type === 'DEFAULT') {
-              defaultAxis = axisItem;
-            }
-          }
+        const steeredAxis = assistantAxisFor(data.axes, NPSteerType.STEERED);
+        const defaultAxis = assistantAxisFor(data.axes, NPSteerType.DEFAULT);
+        if (onAssistantAxisData && (steeredAxis || defaultAxis)) {
           onAssistantAxisData(steeredAxis, defaultAxis);
         }
       }
@@ -432,7 +424,7 @@ export default function AssistantAxisChat({
   }
 
   return (
-    <div className="relative flex h-[calc(100dvh)] w-full min-w-0 flex-col items-center text-sm font-medium leading-normal text-slate-500 sm:h-full sm:max-h-[calc(100dvh-75px)] sm:min-h-[calc(100dvh-75px)]">
+    <div className="relative flex h-[calc(100dvh_-_var(--embed-bar-height))] w-full min-w-0 flex-col items-center text-sm font-medium leading-normal text-slate-500 sm:h-full sm:max-h-[calc(100dvh_-_var(--site-chrome-height))] sm:min-h-[calc(100dvh_-_var(--site-chrome-height))]">
       <AssistantAxisWelcomeModal onLoadDemo={loadSavedSteerOutput} onFreeChat={reset} initialSavedId={initialSavedId} />
 
       {/* Share Modal */}
@@ -482,12 +474,12 @@ export default function AssistantAxisChat({
                   settings: {
                     temperature,
                     steerTokens,
-                    freqPenalty,
+                    presencePenalty,
                     strMultiple,
                     steerMethod,
                   },
                   chartData,
-                  // Include raw axis data with pcValues and pcValuesPostCap
+                  // The readings the chart was drawn from, both pre- and post-cap
                   assistantAxis: {
                     steered: rawSteeredAxis,
                     default: rawDefaultAxis,
@@ -702,7 +694,7 @@ export default function AssistantAxisChat({
       <div className="relative flex h-full w-full max-w-screen-2xl flex-col px-5 sm:flex-row 2xl:px-0">
         <div
           ref={defaultScrollContainerRef}
-          className="absolute right-2 top-0 order-2 h-[calc(50dvh-140px)] max-h-[calc(50dvh-140px)] w-[calc(100dvw-135px)] max-w-[calc(100dvw-135px)] flex-1 flex-col overflow-y-scroll rounded-xl bg-slate-100 px-2 text-left text-xs text-slate-400 sm:relative sm:right-0 sm:order-1 sm:flex sm:h-full sm:max-h-[calc(100dvh-320px)] sm:min-h-[calc(100dvh-320px)] sm:w-full sm:max-w-full sm:px-5"
+          className="absolute right-2 top-0 order-2 h-[calc(50dvh_-_140px_-_var(--embed-bar-height)/2)] max-h-[calc(50dvh_-_140px_-_var(--embed-bar-height)/2)] w-[calc(100dvw-135px)] max-w-[calc(100dvw-135px)] flex-1 flex-col overflow-y-scroll rounded-xl bg-slate-100 px-2 text-left text-xs text-slate-400 sm:relative sm:right-0 sm:order-1 sm:flex sm:h-full sm:max-h-[calc(100dvh_-_var(--site-chrome-height)_-_245px)] sm:min-h-[calc(100dvh_-_var(--site-chrome-height)_-_245px)] sm:w-full sm:max-w-full sm:px-5"
         >
           <div className="sticky top-0.5 flex w-full flex-row justify-center from-slate-100 via-slate-100 to-transparent pb-2 pt-2 uppercase text-slate-700 sm:top-0 sm:bg-gradient-to-b sm:pb-5 sm:pt-5">
             <div className="-mt-1 select-none rounded-full bg-slate-100 px-3 pb-1 pt-1 text-[11px] font-bold normal-case text-slate-600 sm:-mt-4 sm:bg-transparent sm:px-5 sm:pb-5 sm:pt-2 sm:text-sm">
@@ -740,7 +732,7 @@ export default function AssistantAxisChat({
         {/* PersonaChart in the middle */}
         <div
           ref={chartContainerRef}
-          className="absolute left-0 top-0 order-1 h-full max-w-[120px] flex-1 flex-col overflow-hidden bg-white px-0 pb-40 sm:relative sm:order-2 sm:max-h-[calc(100dvh-180px)] sm:min-h-[calc(100dvh-180px)] sm:max-w-[300px]"
+          className="absolute left-0 top-0 order-1 h-full max-w-[120px] flex-1 flex-col overflow-hidden bg-white px-0 pb-40 sm:relative sm:order-2 sm:max-h-[calc(100dvh_-_var(--site-chrome-height)_-_105px)] sm:min-h-[calc(100dvh_-_var(--site-chrome-height)_-_105px)] sm:max-w-[300px]"
         >
           <div className="relative flex flex-col items-center justify-center gap-y-2">
             <div className="left-0 top-0 hidden w-full items-center justify-center px-2 pt-0 sm:absolute sm:flex sm:pt-[48px]">
@@ -812,8 +804,8 @@ export default function AssistantAxisChat({
                 </button>
                 {(() => {
                   const hasPostCapData =
-                    rawSteeredAxis?.turns?.some((t) => t.pcValuesPostCap) ||
-                    rawDefaultAxis?.turns?.some((t) => t.pcValuesPostCap);
+                    rawSteeredAxis?.turns?.some((t) => t.valuePostCap !== null && t.valuePostCap !== undefined) ||
+                    rawDefaultAxis?.turns?.some((t) => t.valuePostCap !== null && t.valuePostCap !== undefined);
                   return (
                     <button
                       type="button"
@@ -925,7 +917,7 @@ export default function AssistantAxisChat({
         </div>
         <div
           ref={steeredScrollContainerRef}
-          className="absolute bottom-[270px] right-2 order-3 h-[calc(50dvh-140px)] max-h-[calc(50dvh-140px)] w-[calc(100dvw-135px)] max-w-[calc(100dvw-135px)] flex-1 flex-col overflow-y-scroll rounded-xl bg-sky-100 px-2 text-left text-xs text-slate-400 sm:relative sm:bottom-0 sm:right-0 sm:flex sm:h-full sm:max-h-[calc(100dvh-320px)] sm:min-h-[calc(100dvh-320px)] sm:w-full sm:max-w-full sm:px-5"
+          className="absolute bottom-[270px] right-2 order-3 h-[calc(50dvh_-_140px_-_var(--embed-bar-height)/2)] max-h-[calc(50dvh_-_140px_-_var(--embed-bar-height)/2)] w-[calc(100dvw-135px)] max-w-[calc(100dvw-135px)] flex-1 flex-col overflow-y-scroll rounded-xl bg-sky-100 px-2 text-left text-xs text-slate-400 sm:relative sm:bottom-0 sm:right-0 sm:flex sm:h-full sm:max-h-[calc(100dvh_-_var(--site-chrome-height)_-_245px)] sm:min-h-[calc(100dvh_-_var(--site-chrome-height)_-_245px)] sm:w-full sm:max-w-full sm:px-5"
         >
           <div className="sticky top-0.5 flex w-full flex-row justify-center from-sky-100 via-sky-100 to-transparent pb-2 pt-2 uppercase text-sky-700 sm:top-0 sm:bg-gradient-to-b sm:pb-5 sm:pt-5">
             <div className="-mt-1 select-none rounded-full bg-sky-100 px-3 pb-1 pt-1 text-[11px] font-bold normal-case sm:-mt-4 sm:bg-transparent sm:px-5 sm:pb-5 sm:pt-2 sm:text-sm">

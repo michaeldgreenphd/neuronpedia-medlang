@@ -1,5 +1,5 @@
 import { getBlogDateString, getPostBySlug, PostMetaData } from '@/app/blog/blog-util';
-import HomeNewsletterSignup from '@/app/home/home-newsletter-signup';
+import BlogNewsletterSignup from '@/app/home/blog-newsletter-signup';
 import BreadcrumbsComponent from '@/components/breadcrumbs-component';
 import { BreadcrumbLink } from '@/components/shadcn/breadcrumbs';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/shadcn/card';
@@ -22,6 +22,8 @@ const getPageData = async (slug: string): Promise<{ meta: PostMetaData; content:
 export async function generateMetadata(props: Props): Promise<Metadata> {
   const params = await props.params;
   const { meta } = await getPageData(params.slug);
+  // Give one image only. With more, X and other sites can show the blog image instead of the post image.
+  const previewImage = meta.imagePreview || `${ASSET_BASE_URL}/blog/the-residual-stream.jpg`;
   return {
     title: { absolute: `${meta.title} | The Residual Stream` },
     description: meta.description,
@@ -29,27 +31,13 @@ export async function generateMetadata(props: Props): Promise<Metadata> {
       card: 'summary_large_image',
       title: `${meta.title} | The Residual Stream`,
       description: meta.description,
-      images: [
-        {
-          url: meta.imagePreview,
-        },
-        {
-          url: `${ASSET_BASE_URL}/blog/the-residual-stream.jpg`,
-        },
-      ],
+      images: [{ url: previewImage }],
     },
     openGraph: {
       title: `${meta.title} | The Residual Stream`,
       description: meta.description,
       url: `/blog/${params.slug}`,
-      images: [
-        {
-          url: meta.imagePreview,
-        },
-        {
-          url: `${ASSET_BASE_URL}/blog/the-residual-stream.jpg`,
-        },
-      ],
+      images: [{ url: previewImage }],
       locale: 'en_US',
       type: 'website',
       siteName: 'Neuronpedia',
@@ -74,7 +62,7 @@ export default async function Page(props: Props) {
         ]}
       />
       <div className="-mb-4 mt-4 flex w-full max-w-screen-sm justify-center px-2 sm:px-0">
-        <HomeNewsletterSignup />
+        <BlogNewsletterSignup />
       </div>
       <div className="flex w-full max-w-screen-lg flex-col items-center justify-start px-2 pt-4 text-slate-800 sm:flex-row sm:items-start sm:justify-center sm:gap-x-7 sm:px-0">
         <div className="sm:sticky sm:left-0 sm:top-[100px]">

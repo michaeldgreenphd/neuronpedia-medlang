@@ -2,16 +2,20 @@ import { SteerResultChat } from '@/app/api/steer-chat/route';
 import { useGlobalContext } from '@/components/provider/global-provider';
 import SteerChatMessage from '@/components/steer/chat-message';
 import { LoadingSquare } from '@/components/svg/loading-square';
+import { NPSteerMethod, STEER_METHOD_LABELS } from '@/lib/api/inference-types';
 import { IS_ACTUALLY_NEURONPEDIA_ORG } from '@/lib/env';
-import { ChatMessage, STEER_MAX_PROMPT_CHARS, STEER_MAX_PROMPT_CHARS_THINKING, SteerFeature } from '@/lib/utils/steer';
+import {
+  ChatMessage,
+  STEER_LONG_CHAT_MODELS,
+  STEER_MAX_PROMPT_CHARS,
+  STEER_MAX_PROMPT_CHARS_THINKING,
+  SteerFeature,
+} from '@/lib/utils/steer';
 import copy from 'copy-to-clipboard';
 import { EventSourceParserStream } from 'eventsource-parser/stream';
 import { ArrowUp, RotateCcw, Share, X } from 'lucide-react';
-import { NPSteerMethod } from 'neuronpedia-inference-client';
 import { useEffect, useRef } from 'react';
 import ReactTextareaAutosize from 'react-textarea-autosize';
-
-export const NNSIGHT_MODELS = ['llama3.3-70b-it', 'gpt-oss-20b'];
 
 export default function SteerCompletionChat({
   showSettingsOnMobile,
@@ -31,7 +35,7 @@ export default function SteerCompletionChat({
   setUrl,
   temperature,
   steerTokens,
-  freqPenalty,
+  presencePenalty,
   randomSeed,
   seed,
   strMultiple,
@@ -55,7 +59,7 @@ export default function SteerCompletionChat({
   setUrl: (url: string) => void;
   temperature: number;
   steerTokens: number;
-  freqPenalty: number;
+  presencePenalty: number;
   randomSeed: boolean;
   seed: number;
   strMultiple: number;
@@ -123,7 +127,9 @@ export default function SteerCompletionChat({
     const steeredPromptToSendChars = newSteeredChatMessages.map((m) => m.content).join('').length;
 
     // // check for character limit
-    const maxPromptChars = NNSIGHT_MODELS.includes(modelId) ? STEER_MAX_PROMPT_CHARS_THINKING : STEER_MAX_PROMPT_CHARS;
+    const maxPromptChars = STEER_LONG_CHAT_MODELS.includes(modelId)
+      ? STEER_MAX_PROMPT_CHARS_THINKING
+      : STEER_MAX_PROMPT_CHARS;
     if (defaultPromptToSendChars >= maxPromptChars || steeredPromptToSendChars >= maxPromptChars) {
       alert('Sorry, we limit the length of each chat conversation.\nPlease click Reset to start a new conversation.');
       setIsSteering(false);
@@ -150,7 +156,7 @@ export default function SteerCompletionChat({
           features: selectedFeatures,
           temperature,
           n_tokens: steerTokens,
-          freq_penalty: freqPenalty,
+          presence_penalty: presencePenalty,
           seed: randomSeed ? Math.floor(Math.random() * 200000000 - 100000000) : seed,
           strength_multiplier: strMultiple,
           steer_method: steerMethod,
@@ -230,7 +236,7 @@ export default function SteerCompletionChat({
 
   return (
     <div
-      className={`relative h-full max-h-[calc(100dvh-48px)] min-h-[calc(100dvh-48px)] w-full min-w-0 flex-col text-sm font-medium leading-normal text-slate-500 sm:h-full sm:max-h-[calc(100dvh-76px)] sm:min-h-[calc(100dvh-76px)] sm:w-auto sm:basis-2/3 ${
+      className={`relative h-full max-h-[calc(100dvh_-_var(--site-chrome-height))] min-h-[calc(100dvh_-_var(--site-chrome-height))] w-full min-w-0 flex-col text-sm font-medium leading-normal text-slate-500 sm:h-full sm:w-auto sm:basis-2/3 ${
         showSettingsOnMobile ? 'hidden sm:flex' : 'flex'
       }`}
     >
@@ -240,7 +246,7 @@ export default function SteerCompletionChat({
         <div className="flex-1 bg-sky-100" />
       </div>
       <div className="relative flex h-full w-full flex-col sm:flex-row">
-        <div className="hidden h-full flex-1 flex-col overflow-y-scroll bg-slate-100 px-5 py-2 text-left text-xs text-slate-400 sm:flex">
+        <div className="hidden h-full flex-1 flex-col overflow-y-scroll bg-slate-100 px-5 py-2 text-left text-xs text-slate-400 sm:flex sm:max-h-[calc(100dvh_-_var(--site-chrome-height))] sm:min-h-[calc(100dvh_-_var(--site-chrome-height))]">
           <div className="sticky top-0.5 flex flex-row justify-center uppercase text-white sm:top-0">
             <div className="select-none rounded-full bg-slate-100 px-5 py-1 text-[10px] font-bold text-slate-600">
               Default
@@ -260,10 +266,10 @@ export default function SteerCompletionChat({
             {isSteering && <LoadingSquare className="px-1.5 py-3" />}
           </div>
         </div>
-        <div className="flex h-full max-h-[calc(100dvh-48px)] min-h-[calc(100dvh-48px)] w-full flex-1 flex-col overflow-y-scroll bg-sky-100 px-3 py-2 text-left text-xs text-slate-400 sm:max-h-[calc(100dvh-76px)] sm:min-h-[calc(100dvh-76px)] sm:px-5">
+        <div className="flex h-full max-h-[calc(100dvh_-_var(--site-chrome-height))] min-h-[calc(100dvh_-_var(--site-chrome-height))] w-full flex-1 flex-col overflow-y-scroll bg-sky-100 px-3 py-2 text-left text-xs text-slate-400 sm:px-5">
           <div className="sticky top-0.5 flex flex-row justify-center uppercase text-sky-700 sm:top-0">
             <div className="select-none rounded-full bg-sky-100 px-5 py-1 text-[10px] font-bold">
-              {steerMethod === NPSteerMethod.ProjectionCap ? 'Capped' : 'Steered'}
+              {steerMethod === NPSteerMethod.PROJECTION_CAP ? 'Capped' : 'Steered'}
             </div>
           </div>
           <div
@@ -272,13 +278,10 @@ export default function SteerCompletionChat({
           >
             {!isSteering && steeredChatMessages.length === 0 && (
               <div className="w-full pl-3 pr-3 pt-8 text-left text-lg text-sky-600">
-                Hey, {`I'm ${steerMethod === NPSteerMethod.ProjectionCap ? 'capped' : 'steered'} ${modelId}!`}
+                Hey, {`I'm ${steerMethod === NPSteerMethod.PROJECTION_CAP ? 'capped' : 'steered'} ${modelId}!`}
                 {selectedFeatures.length > 0 ? (
                   <div className="mt-5 text-sm text-sky-700">
-                    {`Using method "${steerMethod
-                      .replaceAll('_', ' ')
-                      .toLowerCase()
-                      .replace(/\b\w/g, (c) => c.toUpperCase())}":`}
+                    {`Using method "${STEER_METHOD_LABELS[steerMethod]}":`}
                     {selectedFeatures.slice(0, 5).map((f) => (
                       <div key={f.index} className="ml-3 mt-1">
                         - {f.explanation}

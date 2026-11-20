@@ -61,6 +61,15 @@ export const EmailTemplates: {
   },
 };
 
+// List-Unsubscribe-Post makes the header one-click (RFC 8058), so the client POSTs to the URL.
+const unsubscribeHeaders = (unsubscribeCode: string | undefined): Record<string, string> =>
+  unsubscribeCode
+    ? {
+        'List-Unsubscribe': `<${NEXT_PUBLIC_URL}/api/email/unsubscribe?list=all&code=${unsubscribeCode}>`,
+        'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+      }
+    : {};
+
 export const sendEmail = async (
   emailAddress: string,
   unsubscribeCode: string | undefined,
@@ -90,14 +99,7 @@ export const sendEmail = async (
                 Data: htmlToText(html),
               },
             },
-            Headers: unsubscribeCode
-              ? [
-                  {
-                    Name: 'List-Unsubscribe',
-                    Value: `<${NEXT_PUBLIC_URL}/unsubscribe-all?code=${unsubscribeCode}>`,
-                  },
-                ]
-              : [],
+            Headers: Object.entries(unsubscribeHeaders(unsubscribeCode)).map(([Name, Value]) => ({ Name, Value })),
           },
         },
       });
@@ -115,11 +117,7 @@ export const sendEmail = async (
         subject,
         html,
         text: htmlToText(html),
-        headers: unsubscribeCode
-          ? {
-              'List-Unsubscribe': `<${NEXT_PUBLIC_URL}/unsubscribe-all?code=${unsubscribeCode}>`,
-            }
-          : {},
+        headers: unsubscribeHeaders(unsubscribeCode),
       });
       if (resendDotComResult.error) {
         console.error('Resend email failed to send', resendDotComResult);
@@ -135,11 +133,7 @@ export const sendEmail = async (
           subject,
           html,
           text: htmlToText(html),
-          headers: unsubscribeCode
-            ? {
-                'List-Unsubscribe': `<${NEXT_PUBLIC_URL}/unsubscribe-all?code=${unsubscribeCode}>`,
-              }
-            : undefined,
+          headers: unsubscribeHeaders(unsubscribeCode),
         };
         await smtpTransporter.sendMail(mailOptions);
       } catch (error) {
@@ -182,16 +176,10 @@ export const sendLoginEmail = async (emailAddress: string, signInURL: string) =>
           </td>
         </tr>
         <tr>
-          <td align="center" style="padding: 8px 40px 16px 40px;">
-            <table border="0" cellspacing="0" cellpadding="0">
-              <tr>
-                <td align="center" style="border-radius: 5px;">
-                  <a href="${signInURL}" target="_blank" style="font-size: 14px; font-family: Helvetica, Arial, sans-serif; color: ${buttonColor}; text-decoration: none; display: inline-block; font-weight: normal;">
-                    ${signInURL}
-                  </a>
-                </td>
-              </tr>
-            </table>
+          <td align="center" style="padding: 8px 40px 16px 40px; word-break: break-all; overflow-wrap: break-word;">
+            <a href="${signInURL}" target="_blank" style="font-size: 14px; font-family: Helvetica, Arial, sans-serif; color: ${buttonColor}; text-decoration: none; font-weight: normal; word-break: break-all; overflow-wrap: break-word;">
+              ${signInURL}
+            </a>
           </td>
         </tr>
         <tr>

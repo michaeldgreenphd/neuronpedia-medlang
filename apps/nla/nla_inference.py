@@ -17,6 +17,7 @@ or passed explicitly as arguments.
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import math
@@ -25,16 +26,27 @@ import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import sglang as sgl
 import torch
 import yaml
 from huggingface_hub import snapshot_download
+from interp_engine import SamplingSettings, read_recommended_sampling, resolve_sampling
 from safetensors import safe_open
 from safetensors.torch import load_file
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+from chat_template_spans import encode_with_special
+
+if TYPE_CHECKING:
+    # sglang is the opt-in legacy verbalizer backend (NLA_VERBALIZER_BACKEND=sglang), installed
+    # by hand rather than declared: it pins transformers<5 and conflicts with vLLM 0.25. So the
+    # runtime import stays inside the one method that needs it, and this exists only so the
+    # annotation names a real type instead of `Any`.
+    from sglang.srt.managers.io_struct import (  # pyright: ignore[reportMissingImports]
+        GenerateReqInput,
+    )
 
 # ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -104,9 +116,7 @@ Here is the vector:
 Please provide an explanation."""
 
 # Default reconstructor prompt template
-DEFAULT_RECONSTRUCTOR_PROMPT_TEMPLATE = (
-    "Summary of the following text: <text>{explanation}</text> <summary>"
-)
+DEFAULT_RECONSTRUCTOR_PROMPT_TEMPLATE = "Summary of the following text: <text>{explanation}</text> <summary>"
 
 # This file is OSS-standalone so cannot import arch_adapters; the registry is
 # small and the drift hazard of a prefix-match (a hypothetical "phi-gemma-moe"
@@ -143,16 +153,85 @@ def resolve_checkpoint_path(model_path: str) -> str:
       - HF hub ID like 'kitft/nla-qwen2.5-7b-actor-step2000'
     """
     if Path(model_path).is_dir():
+        _sanitize_tokenizer_config(model_path)
         return model_path
     # Treat as HF hub ID — snapshot_download caches locally.
     # Skip Meta's `original/consolidated.*.pth` shards: these are duplicates of
     # the HF-format `*.safetensors` weights we actually load, but ~17.6 GB each
     # (e.g. 8 × 17.6 GB = ~140 GB extra for a Llama-3.x-70B repo).
     print(f"[NLA] Downloading {model_path} from HuggingFace Hub...")
-    return snapshot_download(
+    local_path = snapshot_download(
         model_path,
         ignore_patterns=["original/*", "consolidated.*"],
     )
+    _sanitize_tokenizer_config(local_path)
+    return local_path
+
+
+def _sanitize_tokenizer_config(local_path: str) -> None:
+    """Fix a malformed ``extra_special_tokens`` list in ``tokenizer_config.json``.
+
+    Some NLA checkpoints (e.g. dormantx/Qwen2.5-1.5B-NLA-*) were saved with
+    ``extra_special_tokens`` as a **list** of token strings. transformers >=
+    4.49 expects a ``dict`` and calls ``.keys()`` on it, so loading crashes
+    with ``AttributeError: 'list' object has no attribute 'keys'``. This bites
+    both our own ``AutoTokenizer.from_pretrained`` and the tokenizer that
+    ``sgl.Engine`` loads in its subprocess from the same ``model_path``.
+
+    We rewrite the config in place: move the stray tokens into
+    ``additional_special_tokens`` (where standard Qwen2.5 tokenizers keep them)
+    and reset ``extra_special_tokens`` to an empty dict. No-op for well-formed
+    configs. HF cache blobs are symlinked, so we replace the symlink with a
+    real file to avoid mutating the shared blob store.
+    """
+    cfg_path = Path(local_path) / "tokenizer_config.json"
+    if not cfg_path.is_file():
+        return
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return
+
+    extra = cfg.get("extra_special_tokens")
+    if not isinstance(extra, list):
+        return
+
+    existing = cfg.get("additional_special_tokens") or []
+    if not isinstance(existing, list):
+        existing = []
+    merged = existing + [t for t in extra if t not in existing]
+    cfg["additional_special_tokens"] = merged
+    cfg["extra_special_tokens"] = {}
+
+    print(
+        f"[NLA] Sanitizing malformed 'extra_special_tokens' (list) in {cfg_path}: "
+        "moving tokens to 'additional_special_tokens'."
+    )
+    # Replace the symlink (if any) with a fresh regular file so we don't clobber
+    # the content-addressed blob shared across snapshots.
+    if cfg_path.is_symlink():
+        cfg_path.unlink()
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+
+
+def _load_tokenizer(local_path: str) -> Any:
+    """Load a tokenizer, repairing a malformed ``extra_special_tokens`` config
+    on disk first (see :func:`_sanitize_tokenizer_config`)."""
+    _sanitize_tokenizer_config(local_path)
+    return AutoTokenizer.from_pretrained(local_path, trust_remote_code=True)
+
+
+def load_causal_lm(local_path: str, **kwargs: Any) -> Any:
+    """``AutoModelForCausalLM.from_pretrained``, returning an untyped handle.
+
+    transformers 5.14 annotates the return as ``_BaseModelWithGenerate``, and on that type a
+    checker can call neither ``.to(device)`` (the argument binds to ``self``) nor ``.generate()``
+    (it wants a ``self`` satisfying a protocol the class does not implement). Both are upstream
+    annotation bugs rather than real errors, so every loaded model is laundered through here --
+    that keeps the workaround in one documented place instead of an ignore comment on each of
+    the dozen ``.to`` / ``.generate`` / submodule call sites across this app.
+    """
+    return AutoModelForCausalLM.from_pretrained(local_path, **kwargs)
 
 
 def make_nla_config(
@@ -260,17 +339,14 @@ def _validate_config_against_tokenizer(cfg: NLAConfig, tokenizer: Any) -> None:
     """Assert injection char/neighbors match the live tokenizer."""
     live_inj = tokenizer.encode(cfg.injection_char, add_special_tokens=False)
     assert live_inj == [cfg.injection_token_id], (
-        f"tokenizer drift: {cfg.injection_char!r} -> {live_inj}, config says "
-        f"[{cfg.injection_token_id}]."
+        f"tokenizer drift: {cfg.injection_char!r} -> {live_inj}, config says [{cfg.injection_token_id}]."
     )
     assert live_inj[0] != tokenizer.unk_token_id, f"{cfg.injection_char!r} maps to UNK"
 
     content = cfg.verbalizer_prompt_template.format(injection_char=cfg.injection_char)
     ids = _tokenize_chat_with_merges(tokenizer, content)
     matches = [i for i, tok in enumerate(ids) if tok == cfg.injection_token_id]
-    assert len(matches) == 1, (
-        f"injection token appears {len(matches)}x in canonical prompt (expected 1)."
-    )
+    assert len(matches) == 1, f"injection token appears {len(matches)}x in canonical prompt (expected 1)."
     p = matches[0]
     assert 0 < p < len(ids) - 1
     assert ids[p - 1] == cfg.injection_left_neighbor_id, (
@@ -293,9 +369,7 @@ def load_embedding_only(
 
     def _find_key(keys: list[str], where: str) -> str:
         m = [k for k in keys if k.endswith(_EMBED_KEY_SUFFIXES)]
-        assert len(m) == 1, (
-            f"expected exactly one input-embedding key in {where}, got {m!r}"
-        )
+        assert len(m) == 1, f"expected exactly one input-embedding key in {where}, got {m!r}"
         return m[0]
 
     index_path = root / "model.safetensors.index.json"
@@ -361,10 +435,121 @@ def inject_at_marked_positions(
         out[b, p] = vectors[vec_idx]
         vec_idx += 1
     assert vec_idx == vectors.shape[0], (
-        f"found {vec_idx} injection sites with correct neighbors, expected "
-        f"{vectors.shape[0]}."
+        f"found {vec_idx} injection sites with correct neighbors, expected {vectors.shape[0]}."
     )
     return out
+
+
+def resolve_dtype_for_device(device: str | None) -> torch.dtype:
+    """Pick a safe compute dtype for a placement device.
+
+    MPS has poor/incomplete bf16 support, so bf16-native checkpoints are run in
+    float16 there; everywhere else (CUDA, CPU) we keep bf16, which matches how
+    these NLA checkpoints were trained.
+    """
+    dev = (device or "").lower()
+    if dev.startswith("mps"):
+        return torch.float16
+    return torch.bfloat16
+
+
+def build_injected_embeds(
+    cfg: NLAConfig,
+    tokenizer: Any,
+    embed: torch.nn.Embedding,
+    embed_scale: float,
+    v_raw: torch.Tensor,
+    prompt_content: str | None,
+) -> torch.Tensor:
+    """Tokenize -> embed -> arch-scale -> inject. Returns embeds ``[1, T, d]`` (fp32, CPU).
+
+    Shared by the engine ``Verbalizer`` and the sglang ``NLAClient``; all math here is
+    device-neutral.
+    """
+    if prompt_content is None:
+        content = cfg.verbalizer_prompt_template.format(injection_char=cfg.injection_char)
+    else:
+        assert INJECT_PLACEHOLDER in prompt_content, f"custom prompt must contain {INJECT_PLACEHOLDER!r}"
+        content = prompt_content.replace(INJECT_PLACEHOLDER, cfg.injection_char)
+
+    input_ids = _tokenize_chat_with_merges(tokenizer, content)
+    ids_t = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
+
+    with torch.no_grad():
+        embeds = (embed(ids_t.to(embed.weight.device)) * embed_scale).float()
+
+    assert torch.isfinite(v_raw).all(), "activation has NaN/Inf"
+    v_scaled = normalize_activation(v_raw.float().view(1, -1), cfg.injection_scale)
+
+    return inject_at_marked_positions(
+        ids_t,
+        embeds.cpu(),
+        v_scaled,
+        cfg.injection_token_id,
+        cfg.injection_left_neighbor_id,
+        cfg.injection_right_neighbor_id,
+    )
+
+
+def strip_special_tokens(tokenizer: Any, text: str) -> str:
+    """Remove the tokenizer's special tokens and trim surrounding whitespace."""
+    specials = getattr(tokenizer, "all_special_tokens", None) or []
+    # Longest-first so multi-char tokens are removed before any substrings.
+    for tok in sorted((t for t in specials if t), key=len, reverse=True):
+        text = text.replace(tok, "")
+    return text.strip()
+
+
+def summarize_meta(out: dict) -> str:
+    """Compact one-liner of a result's ``meta_info`` for warnings."""
+    meta = out.get("meta_info") if isinstance(out, dict) else None
+    if not isinstance(meta, dict):
+        return ""
+    finish = meta.get("finish_reason")
+    ctoks = meta.get("completion_tokens")
+    ptoks = meta.get("prompt_tokens")
+    return f" finish_reason={finish!r} completion_tokens={ctoks} prompt_tokens={ptoks}"
+
+
+def extract_verbalizer_text(
+    tokenizer: Any,
+    out: dict,
+    extract_explanation: bool,
+    *,
+    context: str | None = None,
+    label: str = "verbalizer",
+) -> str:
+    """Pull the ``<explanation>`` body out of a verbalizer result dict.
+
+    ``out`` must contain ``text`` (the cumulative decoded output) and may contain
+    ``meta_info`` (with a ``finish_reason``). Backend-neutral: works for both the
+    sglang and eager paths.
+    """
+    text = out["text"]
+    if not extract_explanation:
+        return text
+    ctx = f" [context={context!r}]" if context else ""
+    meta_summary = summarize_meta(out)
+    m = EXPLANATION_RE.search(text)
+    if m is None:
+        print(f"[{label}] WARNING: no <explanation> opening tag.{ctx}{meta_summary} Raw[:200]={text[:200]!r}")
+        return strip_special_tokens(tokenizer, text)
+    body = m.group(1).strip()
+    if "</explanation>" not in m.group(0):
+        meta = out.get("meta_info") if isinstance(out, dict) else None
+        finish = meta.get("finish_reason") if isinstance(meta, dict) else None
+        stop_matched_close_tag = (
+            isinstance(finish, dict) and finish.get("type") == "stop" and finish.get("matched") == "</explanation>"
+        )
+        if not stop_matched_close_tag:
+            head = text[:120]
+            tail = text[-120:] if len(text) > 120 else ""
+            print(
+                f"[{label}] WARNING: <explanation> not closed; "
+                f"returning partial body.{ctx}{meta_summary} "
+                f"Raw_head={head!r} Raw_tail={tail!r} Partial body={body!r}"
+            )
+    return body
 
 
 # ─── Client ─────────────────────────────────────────────────────────────────
@@ -392,6 +577,7 @@ class NLAClient:
         kv_cache_dtype: str | None = None,
         cuda_graph_max_bs: int | None = None,
         enable_torch_compile: bool = False,
+        max_model_len: int | None = None,
     ):
         """
         verbalizer_model_path: HF hub ID (e.g. 'kitft/nla-qwen2.5-7b-actor-step2000')
@@ -435,13 +621,18 @@ class NLAClient:
                           persistent path to amortize the cost across
                           restarts. Free at runtime; no steady-state VRAM
                           cost.
+        max_model_len:    Context length to size the KV pool against, passed
+                          to sglang as ``context_length``. None uses the base
+                          model's own maximum, which on a long-context base
+                          (Gemma 3 at 131072) buys pool the verbalizer never
+                          uses — its prompt is a fixed template and its output
+                          is capped by ``NLA_MAX_NEW_TOKENS_LIMIT``.
         """
         # Resolve HF hub path -> local dir
         local_path = resolve_checkpoint_path(verbalizer_model_path)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            local_path, trust_remote_code=True
-        )
+        self.tokenizer = _load_tokenizer(local_path)
+        self.recommended_sampling = read_recommended_sampling(local_path)
 
         # Load or use provided NLA config
         if nla_config is not None:
@@ -455,14 +646,11 @@ class NLAClient:
             )
 
         # Load embedding table for injection (lightweight, CPU is fine)
-        self.embed = load_embedding_only(local_path, dtype=torch.bfloat16).to(
-            embed_device
-        )
+        self.embed = load_embedding_only(local_path, dtype=torch.bfloat16).to(embed_device)
         self.embed_scale = resolve_embed_scale(local_path)
 
         assert self.embed.weight.shape[1] == self.cfg.d_model, (
-            f"embedding d={self.embed.weight.shape[1]} != config "
-            f"d_model={self.cfg.d_model}."
+            f"embedding d={self.embed.weight.shape[1]} != config d_model={self.cfg.d_model}."
         )
 
         # Resolve the verbalizer's GPU index for sglang's `base_gpu_id`. None
@@ -477,9 +665,7 @@ class NLAClient:
                     f"sgl.Engine requires CUDA; pass 'cuda', 'cuda:0', "
                     f"'cuda:1', etc."
                 )
-        self.device = (
-            f"cuda:{base_gpu_id}" if base_gpu_id is not None else device or "cuda"
-        )
+        self.device = f"cuda:{base_gpu_id}" if base_gpu_id is not None else device or "cuda"
 
         # Auto-fallback: if FP8 was requested but the verbalizer's GPU compute
         # capability doesn't support sglang's fp8e4nv kernels (Ampere/Ada),
@@ -488,13 +674,8 @@ class NLAClient:
         if quantization == "fp8" and not gpu_supports_fp8_native(base_gpu_id or 0):
             cap_str = "n/a"
             if torch.cuda.is_available():
-                try:
-                    cap_str = ".".join(
-                        str(x)
-                        for x in torch.cuda.get_device_capability(base_gpu_id or 0)
-                    )
-                except Exception:
-                    pass
+                with contextlib.suppress(Exception):
+                    cap_str = ".".join(str(x) for x in torch.cuda.get_device_capability(base_gpu_id or 0))
             print(
                 f"[NLAClient] WARNING: quantization='fp8' was requested but "
                 f"GPU compute capability {cap_str} on cuda:{base_gpu_id or 0} "
@@ -516,14 +697,14 @@ class NLAClient:
             f"base_gpu_id={base_gpu_id if base_gpu_id is not None else 'default'}, "
             f"tp_size={tp_size})..."
         )
-        engine_kwargs: dict[str, Any] = dict(
-            model_path=local_path,
-            tp_size=tp_size,
-            disable_radix_cache=True,
-            mem_fraction_static=mem_fraction_static,
-            trust_remote_code=True,
-            dtype="bfloat16",
-        )
+        engine_kwargs: dict[str, Any] = {
+            "model_path": local_path,
+            "tp_size": tp_size,
+            "disable_radix_cache": True,
+            "mem_fraction_static": mem_fraction_static,
+            "trust_remote_code": True,
+            "dtype": "bfloat16",
+        }
         if quantization is not None:
             engine_kwargs["quantization"] = quantization
         if base_gpu_id is not None:
@@ -532,10 +713,21 @@ class NLAClient:
             engine_kwargs["kv_cache_dtype"] = kv_cache_dtype
         if cuda_graph_max_bs is not None:
             engine_kwargs["cuda_graph_max_bs"] = cuda_graph_max_bs
+        if max_model_len is not None:
+            engine_kwargs["context_length"] = max_model_len
         if enable_torch_compile:
             engine_kwargs["enable_torch_compile"] = True
-        self.engine = sgl.Engine(**engine_kwargs)
+        # Lazy import: sglang is CUDA-only and now an OPTIONAL backend (the default
+        # verbalizer is the engine-owned vLLM prompt_embeds path). Keeping the import
+        # here lets nla_inference import cleanly in environments without sglang, which is
+        # also why it is unresolvable for pyright: it is installed by hand, not declared.
+        import sglang as sgl  # pyright: ignore[reportMissingImports]
 
+        # Annotated because `shutdown()` sets it back to None; the generate paths below
+        # would otherwise each have to re-prove the engine is still up.
+        self.engine: Any = sgl.Engine(**engine_kwargs)
+
+        self.backend = "sglang"
         self.quantization = quantization
         self.kv_cache_dtype = kv_cache_dtype
         self.cuda_graph_max_bs = cuda_graph_max_bs
@@ -551,6 +743,9 @@ class NLAClient:
             f"torch_compile={enable_torch_compile} device={self.device}"
         )
 
+    async def aload(self) -> None:
+        """Nothing deferred: ``sgl.Engine`` loads and warms in ``__init__``. Here for interface parity."""
+
     def shutdown(self):
         """Shut down the sgl.Engine."""
         if self.engine is not None:
@@ -559,42 +754,15 @@ class NLAClient:
 
     # ─── Core inference step ──────────────────────────────────────────────
 
-    def _build_embeds(
-        self, v_raw: torch.Tensor, prompt_content: str | None
-    ) -> np.ndarray:
+    def _build_embeds(self, v_raw: torch.Tensor, prompt_content: str | None) -> np.ndarray:
         """Tokenize -> embed -> arch-scale -> inject. Returns embeds [T, d]."""
-        if prompt_content is None:
-            content = self.cfg.verbalizer_prompt_template.format(
-                injection_char=self.cfg.injection_char
-            )
-        else:
-            assert INJECT_PLACEHOLDER in prompt_content, (
-                f"custom prompt must contain {INJECT_PLACEHOLDER!r}"
-            )
-            content = prompt_content.replace(
-                INJECT_PLACEHOLDER, self.cfg.injection_char
-            )
-
-        input_ids = _tokenize_chat_with_merges(self.tokenizer, content)
-        ids_t = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
-
-        with torch.no_grad():
-            embeds = (
-                self.embed(ids_t.to(self.embed.weight.device)) * self.embed_scale
-            ).float()
-
-        assert torch.isfinite(v_raw).all(), "activation has NaN/Inf"
-        v_scaled = normalize_activation(
-            v_raw.float().view(1, -1), self.cfg.injection_scale
-        )
-
-        injected = inject_at_marked_positions(
-            ids_t,
-            embeds.cpu(),
-            v_scaled,
-            self.cfg.injection_token_id,
-            self.cfg.injection_left_neighbor_id,
-            self.cfg.injection_right_neighbor_id,
+        injected = build_injected_embeds(
+            self.cfg,
+            self.tokenizer,
+            self.embed,
+            self.embed_scale,
+            v_raw,
+            prompt_content,
         )
         # sgl.Engine wants [T, d] unbatched, contiguous float32
         return injected[0].contiguous().numpy()
@@ -608,32 +776,52 @@ class NLAClient:
     # warning even though the model emitted it correctly.
     _DEFAULT_STOP_SEQUENCES: tuple[str, ...] = ("</explanation>",)
 
+    def sampling_settings(
+        self,
+        *,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        presence_penalty: float | None = None,
+    ) -> SamplingSettings:
+        """What a generation with these knobs runs with: the caller's value, else the verbalizer
+        checkpoint's ``generation_config.json``, else neutral -- the inference server's rule."""
+        return resolve_sampling(
+            self.recommended_sampling,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            presence_penalty=presence_penalty,
+        )
+
     def _make_req(
         self,
         activation: Iterable[float] | np.ndarray | torch.Tensor,
         *,
         prompt: str | None = None,
-        temperature: float = 1.0,
+        sampling: SamplingSettings | None = None,
         max_new_tokens: int = 512,
-    ) -> "GenerateReqInput":
+    ) -> GenerateReqInput:
         """Build a GenerateReqInput with input_embeds.
 
         Engine.generate() / async_generate() don't expose the input_embeds
         parameter (as of SGLang 0.5.8), so we construct the request object
         directly and feed it to the tokenizer_manager.
         """
-        from sglang.srt.managers.io_struct import GenerateReqInput
+        from sglang.srt.managers.io_struct import (  # pyright: ignore[reportMissingImports]
+            GenerateReqInput,
+        )
 
         v = torch.as_tensor(np.asarray(activation, dtype=np.float32))
-        assert v.numel() == self.cfg.d_model, (
-            f"activation length {v.numel()} != d_model {self.cfg.d_model}"
-        )
+        assert v.numel() == self.cfg.d_model, f"activation length {v.numel()} != d_model {self.cfg.d_model}"
         embeds_np = self._build_embeds(v, prompt)
 
+        settings = sampling or self.sampling_settings()
         return GenerateReqInput(
             input_embeds=embeds_np.tolist(),
             sampling_params={
-                "temperature": temperature,
+                # sglang spells "no filtering" as vLLM does: top_k -1, top_p 1.0.
+                **settings.vllm_kwargs(),
                 "max_new_tokens": max_new_tokens,
                 "skip_special_tokens": False,
                 "stop": list(self._DEFAULT_STOP_SEQUENCES),
@@ -647,25 +835,12 @@ class NLAClient:
 
     @staticmethod
     def _summarize_meta(out: dict) -> str:
-        """Compact one-liner of sglang's `meta_info` for warnings.
+        """Compact one-liner of sglang's `meta_info` for warnings."""
+        return summarize_meta(out)
 
-        sglang attaches a `meta_info` dict on each generation result with
-        diagnostic fields like `finish_reason` ({"type": "stop"|"length"|
-        "abort", "matched": <stop-string-or-token-id>}), `completion_tokens`,
-        `prompt_tokens`, etc. When generation ends without `</explanation>`
-        this is the only way to tell *why* (length truncation vs EOS vs
-        stop-string match vs abort) — the raw text alone is ambiguous.
-        Returns "" when meta_info is absent (e.g. partial-stream callers).
-        """
-        meta = out.get("meta_info") if isinstance(out, dict) else None
-        if not isinstance(meta, dict):
-            return ""
-        finish = meta.get("finish_reason")
-        ctoks = meta.get("completion_tokens")
-        ptoks = meta.get("prompt_tokens")
-        return (
-            f" finish_reason={finish!r} completion_tokens={ctoks} prompt_tokens={ptoks}"
-        )
+    def _strip_special_tokens(self, text: str) -> str:
+        """Remove the tokenizer's special tokens and trim surrounding whitespace."""
+        return strip_special_tokens(self.tokenizer, text)
 
     def _extract_text(
         self,
@@ -674,46 +849,7 @@ class NLAClient:
         *,
         context: str | None = None,
     ) -> str:
-        text = out["text"]
-        if not extract_explanation:
-            return text
-        ctx = f" [context={context!r}]" if context else ""
-        meta_summary = self._summarize_meta(out)
-        m = EXPLANATION_RE.search(text)
-        if m is None:
-            print(
-                f"[NLAClient] WARNING: no <explanation> opening tag.{ctx}"
-                f"{meta_summary} Raw[:200]={text[:200]!r}"
-            )
-            return text
-        body = m.group(1).strip()
-        if "</explanation>" not in m.group(0):
-            # If sglang's `</explanation>` stop-string matched, the model
-            # DID emit the closing tag — sglang just trimmed it from the
-            # output (when no_stop_trim=False). The body is correct; no
-            # warning needed. We set no_stop_trim=True in _make_req to
-            # avoid this normally, but stay resilient if that flag is ever
-            # ignored / removed by an sglang upgrade.
-            meta = out.get("meta_info") if isinstance(out, dict) else None
-            finish = meta.get("finish_reason") if isinstance(meta, dict) else None
-            stop_matched_close_tag = (
-                isinstance(finish, dict)
-                and finish.get("type") == "stop"
-                and finish.get("matched") == "</explanation>"
-            )
-            if not stop_matched_close_tag:
-                # Real partial body: max_new_tokens truncation, EOS without
-                # closing tag, abort, etc. Dump head/tail so it's obvious
-                # the opening <explanation> IS present (regex group(1)
-                # excludes the tag itself by construction).
-                head = text[:120]
-                tail = text[-120:] if len(text) > 120 else ""
-                print(
-                    f"[NLAClient] WARNING: <explanation> not closed; "
-                    f"returning partial body.{ctx}{meta_summary} "
-                    f"Raw_head={head!r} Raw_tail={tail!r} Partial body={body!r}"
-                )
-        return body
+        return extract_verbalizer_text(self.tokenizer, out, extract_explanation, context=context, label="NLAClient")
 
     async def async_generate(
         self,
@@ -721,7 +857,7 @@ class NLAClient:
         *,
         prompt: str | None = None,
         extract_explanation: bool = True,
-        temperature: float = 1.0,
+        sampling: SamplingSettings | None = None,
         max_new_tokens: int = 200,
         context: str | None = None,
     ) -> str:
@@ -733,7 +869,7 @@ class NLAClient:
         obj = self._make_req(
             activation,
             prompt=prompt,
-            temperature=temperature,
+            sampling=sampling,
             max_new_tokens=max_new_tokens,
         )
         generator = self.engine.tokenizer_manager.generate_request(obj, None)
@@ -745,7 +881,7 @@ class NLAClient:
         activation: Iterable[float] | np.ndarray | torch.Tensor,
         *,
         prompt: str | None = None,
-        temperature: float = 1.0,
+        sampling: SamplingSettings | None = None,
         max_new_tokens: int = 200,
     ):
         """Yield sglang output dicts as the verbalizer generates tokens.
@@ -760,7 +896,7 @@ class NLAClient:
         obj = self._make_req(
             activation,
             prompt=prompt,
-            temperature=temperature,
+            sampling=sampling,
             max_new_tokens=max_new_tokens,
         )
         obj.stream = True
@@ -774,7 +910,7 @@ class NLAClient:
         *,
         prompt: str | None = None,
         extract_explanation: bool = True,
-        temperature: float = 1.0,
+        sampling: SamplingSettings | None = None,
         max_new_tokens: int = 200,
         context: str | None = None,
     ) -> str:
@@ -782,7 +918,7 @@ class NLAClient:
         obj = self._make_req(
             activation,
             prompt=prompt,
-            temperature=temperature,
+            sampling=sampling,
             max_new_tokens=max_new_tokens,
         )
         generator = self.engine.tokenizer_manager.generate_request(obj, None)
@@ -830,10 +966,7 @@ def _is_fp8_weight(weight: Any) -> bool:
     data = getattr(weight, "data", None)
     if data is not None:
         type_names.append(type(data).__name__)
-    for tn in type_names:
-        if any(marker in tn for marker in _FP8_TYPE_MARKERS):
-            return True
-    return False
+    return any(any(marker in tn for marker in _FP8_TYPE_MARKERS) for tn in type_names)
 
 
 def _count_fp8_linear_weights(module: torch.nn.Module) -> tuple[int, int]:
@@ -849,6 +982,50 @@ def _count_fp8_linear_weights(module: torch.nn.Module) -> tuple[int, int]:
             if _is_fp8_weight(m.weight):
                 fp8_count += 1
     return fp8_count, total
+
+
+_INT4_TYPE_MARKERS = (
+    # torchao >= 0.14 packs int4 into per-format tensor subclasses, all named
+    # Int4*: Int4TilePackedTo4dTensor (what our config selects),
+    # Int4PreshuffledTensor, Int4PlainInt32Tensor, Int4MarlinSparseTensor...
+    "Int4",
+    # torchao < 0.14 packed int4 as AffineQuantizedTensor + TensorCoreTiledLayout.
+    "AffineQuantized",
+    "TensorCoreTiled",
+)
+
+
+def _is_int4_weight(weight: Any) -> bool:
+    """Detect a torchao INT4 weight-only quantized tensor.
+
+    Deliberately NOT `_is_fp8_weight`: an int4 tensor subclass still reports
+    the original bf16 `dtype` AND a 2-byte `element_size`, so both of that
+    helper's numeric signals miss, and none of `_FP8_TYPE_MARKERS` match the
+    Int4* class names torchao >= 0.14 produces. Using the fp8 counter here
+    scored a correctly-quantized 70B backbone as 0/378 and printed a "did not
+    quantize any Linear layers" warning while the weights were, in fact,
+    packed. Type name is the only reliable signal left.
+    """
+    type_names = [type(weight).__name__]
+    data = getattr(weight, "data", None)
+    if data is not None:
+        type_names.append(type(data).__name__)
+    return any(marker in tn for tn in type_names for marker in _INT4_TYPE_MARKERS)
+
+
+def _count_int4_linear_weights(module: torch.nn.Module) -> tuple[int, int]:
+    """Return (int4_count, total_linear_count) for diagnostic logging.
+
+    See `_is_int4_weight` for the detection signals.
+    """
+    int4_count = 0
+    total = 0
+    for m in module.modules():
+        if isinstance(m, torch.nn.Linear):
+            total += 1
+            if _is_int4_weight(m.weight):
+                int4_count += 1
+    return int4_count, total
 
 
 def _summarize_extra_modules(model: torch.nn.Module) -> tuple[list[str], float]:
@@ -904,6 +1081,19 @@ def _text_decoder(inner: torch.nn.Module) -> torch.nn.Module:
     has the layer stack and final norm, regardless of which case we're in.
     """
     return getattr(inner, "language_model", inner)
+
+
+def _decoder_layers(inner: torch.nn.Module) -> torch.nn.ModuleList:
+    """The decoder's layer stack, as something indexable and sized.
+
+    Submodules reached through ``nn.Module.__getattr__`` are typed ``Tensor | Module``, so a
+    bare ``inner.layers`` supports neither ``[i]`` nor ``len()`` as far as a checker knows.
+    """
+    layers = getattr(inner, "layers", None)
+    assert isinstance(layers, torch.nn.ModuleList), (
+        f"{type(inner).__name__} has no `layers` ModuleList (got {type(layers).__name__})"
+    )
+    return layers
 
 
 _VISION_SUBMODULE_ATTRS = (
@@ -991,9 +1181,7 @@ def _actual_storage_bytes(p: torch.Tensor) -> int:
     return p.numel() * p.element_size()
 
 
-def _summarize_top_param_groups(
-    model: torch.nn.Module, top_n: int = 8
-) -> list[tuple[str, float, int]]:
+def _summarize_top_param_groups(model: torch.nn.Module, top_n: int = 8) -> list[tuple[str, float, int]]:
     """Per-top-module byte breakdown for diagnostic logging.
 
     Groups parameters by their top-level module path (the first 1-2 segments
@@ -1067,10 +1255,7 @@ class NLAReconstructor:
                          risk.
         """
         if fp8 and int4:
-            raise ValueError(
-                "fp8 and int4 are mutually exclusive — pick at most one for "
-                "the reconstructor backbone."
-            )
+            raise ValueError("fp8 and int4 are mutually exclusive — pick at most one for the reconstructor backbone.")
         local_path = resolve_checkpoint_path(checkpoint_path)
         checkpoint_dir = Path(local_path)
 
@@ -1096,9 +1281,7 @@ class NLAReconstructor:
             # rather than by "reconstructor"/"critic"; fall back to role lookup.
             prompt_templates = meta["prompt_templates"]
             self.template = (
-                prompt_templates.get("reconstructor")
-                or prompt_templates.get("critic")
-                or prompt_templates.get(role)
+                prompt_templates.get("reconstructor") or prompt_templates.get("critic") or prompt_templates.get(role)
             )
             assert self.template is not None, (
                 f"sidecar prompt_templates has no entry for 'reconstructor', "
@@ -1106,13 +1289,9 @@ class NLAReconstructor:
                 f"{sorted(prompt_templates)!r}."
             )
         else:
-            self.template = (
-                reconstructor_prompt_template or DEFAULT_RECONSTRUCTOR_PROMPT_TEMPLATE
-            )
+            self.template = reconstructor_prompt_template or DEFAULT_RECONSTRUCTOR_PROMPT_TEMPLATE
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            local_path, trust_remote_code=True
-        )
+        self.tokenizer = _load_tokenizer(local_path)
 
         # BOS invariant: training tokenized reconstructor prompts with
         # add_special_tokens=True (reward.py, nla_generate.py). For Gemma/Llama
@@ -1147,7 +1326,7 @@ class NLAReconstructor:
         # values are discarded anyway. Transformers <5 warned and loaded; 5.x
         # raises on mismatch by default — this preserves the prior behavior
         # without weakening any other validation.
-        backbone = AutoModelForCausalLM.from_pretrained(
+        backbone = load_causal_lm(
             local_path,
             torch_dtype=dtype,
             trust_remote_code=True,
@@ -1164,10 +1343,7 @@ class NLAReconstructor:
                 setattr(inner, attr, torch.nn.Identity())
                 break
         else:
-            raise AssertionError(
-                f"no final-LN attribute on {type(inner).__name__} — tried "
-                f"{_FINAL_LN_ATTRS!r}."
-            )
+            raise AssertionError(f"no final-LN attribute on {type(inner).__name__} — tried {_FINAL_LN_ATTRS!r}.")
 
         text_cfg = getattr(backbone.config, "text_config", backbone.config)
         d = text_cfg.hidden_size
@@ -1178,10 +1354,15 @@ class NLAReconstructor:
         elif not hasattr(self, "mse_scale"):
             self.mse_scale = math.sqrt(d)
 
-        self.value_head = torch.nn.Linear(d, d, bias=False, dtype=dtype)
         head_path = checkpoint_dir / "value_head.safetensors"
         assert head_path.exists(), f"no value_head.safetensors at {checkpoint_dir!r}."
-        self.value_head.load_state_dict(load_file(str(head_path)))
+        head_sd = load_file(str(head_path))
+        # Some reconstructor checkpoints train the value head WITH a bias term
+        # (e.g. dormantx/Qwen2.5-1.5B-NLA-L18-ar), others without. Match the
+        # Linear to whatever the checkpoint actually stored so load_state_dict
+        # doesn't reject an unexpected/missing "bias" key.
+        self.value_head = torch.nn.Linear(d, d, bias="bias" in head_sd, dtype=dtype)
+        self.value_head.load_state_dict(head_sd)
 
         self.fp8 = fp8
         self.int4 = int4
@@ -1267,17 +1448,22 @@ class NLAReconstructor:
             import inspect
 
             int4_params = inspect.signature(Int4WeightOnlyConfig).parameters
+            # Both branches are typed against whichever torchao is installed, so exactly
+            # one of them always looks wrong to pyright: v2 declares these two parameters
+            # as enums (it accepts the documented string forms at runtime), and v1's
+            # `use_hqq` does not exist in v2 at all. The `int4_params` probe above is what
+            # makes the call safe, so the annotations are ignored rather than followed.
             if "int4_choose_qparams_algorithm" in int4_params:
                 # v2 API (torchao 0.14+)
                 int4_config = Int4WeightOnlyConfig(
                     group_size=32,
-                    int4_packing_format="tile_packed_to_4d",
-                    int4_choose_qparams_algorithm="hqq",
+                    int4_packing_format="tile_packed_to_4d",  # pyright: ignore[reportArgumentType]
+                    int4_choose_qparams_algorithm="hqq",  # pyright: ignore[reportArgumentType]
                 )
                 hqq_status = "v2 (tile_packed_to_4d + hqq)"
             elif "use_hqq" in int4_params:
                 # v1 API (torchao <0.14)
-                int4_config = Int4WeightOnlyConfig(group_size=32, use_hqq=True)
+                int4_config = Int4WeightOnlyConfig(group_size=32, use_hqq=True)  # pyright: ignore[reportCallIssue]
                 hqq_status = "v1 (use_hqq=True)"
             else:
                 int4_config = Int4WeightOnlyConfig(group_size=32)
@@ -1295,7 +1481,9 @@ class NLAReconstructor:
             torch.cuda.empty_cache()
 
         if fp8 or int4:
-            quant_n, lin_n = _count_fp8_linear_weights(self.backbone)
+            quant_n, lin_n = (
+                _count_fp8_linear_weights(self.backbone) if fp8 else _count_int4_linear_weights(self.backbone)
+            )
             label = "FP8" if fp8 else "INT4"
             print(
                 f"[NLAReconstructor] {label} quantization fingerprint: "
@@ -1323,9 +1511,7 @@ class NLAReconstructor:
         # (reconstructor_prompt_template is a raw string, not chat-template-processed).
         # Qwen has bos_token=None so this is a no-op there. Omitting BOS for
         # Gemma shifts position-0 meaning → degraded reconstruction everywhere.
-        ids = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=True)[
-            "input_ids"
-        ].to(self.device)
+        ids = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=True)["input_ids"].to(self.device)
         out = self.backbone.model(ids, use_cache=False)
         h = out.last_hidden_state[0, -1]
         result = self.value_head(h).float().cpu()
@@ -1376,9 +1562,7 @@ class NLAReconstructor:
             torch.cuda.empty_cache()
         return result
 
-    def score(
-        self, explanation: str, original: np.ndarray | torch.Tensor
-    ) -> tuple[float, float]:
+    def score(self, explanation: str, original: np.ndarray | torch.Tensor) -> tuple[float, float]:
         """(direction-MSE, cos-sim). MSE = 2(1-cos), range [0, 4]."""
         pred = self.reconstruct(explanation)
         return self._score_from_pred(pred, original)
@@ -1390,16 +1574,12 @@ class NLAReconstructor:
     ) -> list[tuple[float, float]]:
         """Batched (mse, cos) scoring. Equivalent to calling .score() per item."""
         assert len(explanations) == len(originals), (
-            f"score_batch: {len(explanations)} explanations vs "
-            f"{len(originals)} originals"
+            f"score_batch: {len(explanations)} explanations vs {len(originals)} originals"
         )
         if not explanations:
             return []
         preds = self.reconstruct_batch(explanations)
-        return [
-            self._score_from_pred(preds[i], originals[i])
-            for i in range(len(explanations))
-        ]
+        return [self._score_from_pred(preds[i], originals[i]) for i in range(len(explanations))]
 
     def _score_from_pred(
         self,
@@ -1455,17 +1635,13 @@ class SourceModel:
         self.truncated = truncate
         self.fp8 = fp8
 
-        print(
-            f"[SourceModel] Loading {model_path} "
-            f"(layer {layer_index}, truncate={truncate}, fp8={fp8})..."
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            local_path, trust_remote_code=True
-        )
+        print(f"[SourceModel] Loading {model_path} (layer {layer_index}, truncate={truncate}, fp8={fp8})...")
+        self.tokenizer = _load_tokenizer(local_path)
+        self.recommended_sampling = read_recommended_sampling(local_path)
         # Load on CPU first so truncation drops weights BEFORE the .to(device)
         # transfer — avoids the transient GPU memory spike of loading the full
         # model onto GPU only to immediately free 25%+ of it.
-        backbone = AutoModelForCausalLM.from_pretrained(
+        backbone = load_causal_lm(
             local_path,
             torch_dtype=dtype,
             trust_remote_code=True,
@@ -1474,9 +1650,7 @@ class SourceModel:
         text_cfg = getattr(backbone.config, "text_config", backbone.config)
         d = text_cfg.hidden_size
         n_layers = text_cfg.num_hidden_layers
-        assert 0 <= layer_index < n_layers, (
-            f"layer_index={layer_index} out of range for {n_layers}-layer model"
-        )
+        assert 0 <= layer_index < n_layers, f"layer_index={layer_index} out of range for {n_layers}-layer model"
 
         # Strip vision tower / multi-modal projector BEFORE .to(device) for
         # multimodal models we only use for text activation extraction. Saves
@@ -1484,15 +1658,10 @@ class SourceModel:
         freed_vision = _strip_vision_components(backbone)
         if freed_vision:
             for attr, gb in freed_vision:
-                print(
-                    f"[SourceModel] stripped non-text submodule {attr}: "
-                    f"freed {gb:.2f} GB (replaced with Identity)"
-                )
+                print(f"[SourceModel] stripped non-text submodule {attr}: freed {gb:.2f} GB (replaced with Identity)")
             gc.collect()
 
-        inner = _text_decoder(
-            backbone.model if hasattr(backbone, "model") else backbone
-        )
+        inner = _text_decoder(backbone.model if hasattr(backbone, "model") else backbone)
 
         if truncate:
             # Same surgery as NLAReconstructor: lm_head + final norm become
@@ -1506,11 +1675,8 @@ class SourceModel:
                     setattr(inner, attr, torch.nn.Identity())
                     break
             else:
-                raise AssertionError(
-                    f"no final-LN attribute on {type(inner).__name__} — tried "
-                    f"{_FINAL_LN_ATTRS!r}."
-                )
-            inner.layers = torch.nn.ModuleList(list(inner.layers)[: layer_index + 1])
+                raise AssertionError(f"no final-LN attribute on {type(inner).__name__} — tried {_FINAL_LN_ATTRS!r}.")
+            inner.layers = torch.nn.ModuleList(list(_decoder_layers(inner))[: layer_index + 1])
             # Force GC on CPU before the GPU transfer so the dropped layer
             # tensors are actually released — without this they may linger
             # on CPU and (in pathological multi-modal layouts) get re-attached
@@ -1544,10 +1710,7 @@ class SourceModel:
             gc.collect()
 
             fp8_n, lin_n = _count_fp8_linear_weights(backbone)
-            print(
-                f"[SourceModel] FP8 quantization fingerprint: "
-                f"{fp8_n}/{lin_n} Linear layers in fp8"
-            )
+            print(f"[SourceModel] FP8 quantization fingerprint: {fp8_n}/{lin_n} Linear layers in fp8")
             if lin_n > 0 and fp8_n == 0:
                 print(
                     "[SourceModel] WARNING: torchao did not quantize any Linear "
@@ -1594,7 +1757,7 @@ class SourceModel:
         # capture buffer. Hook fires on every forward; thread-local check is a
         # no-op when no extract is in progress on this thread.
         self._capture_local = threading.local()
-        target_layer = inner.layers[layer_index]
+        target_layer = _decoder_layers(inner)[layer_index]
 
         def _capture_hook(module, _inputs, output):
             buf = getattr(self._capture_local, "target", None)
@@ -1608,7 +1771,7 @@ class SourceModel:
 
         print(
             f"[SourceModel] ready: d_model={d}  "
-            f"layers={len(inner.layers)}/{n_layers}  "
+            f"layers={len(_decoder_layers(inner))}/{n_layers}  "
             f"extract_layer={layer_index}  truncated={truncate}  fp8={fp8}"
         )
 
@@ -1618,10 +1781,12 @@ class SourceModel:
 
         Returns list of {token, token_id, position, activation} dicts.
         Activations are from the residual stream at self.layer_index.
+
+        Tokenizes through ``encode_with_special`` so these positions stay 1:1 with the spans
+        ``/explain`` computes for the same text — the two are compared by position downstream,
+        and a chat-template render would otherwise pick up a second BOS here.
         """
-        ids = self.tokenizer(text, return_tensors="pt", add_special_tokens=True)[
-            "input_ids"
-        ].to(self.device)
+        ids = torch.tensor([encode_with_special(self.tokenizer, text)], device=self.device)
 
         # Arm the per-thread capture buffer. The hook on layer[layer_index]
         # appends the layer output during the forward pass.
@@ -1633,8 +1798,7 @@ class SourceModel:
             self._capture_local.target = None
 
         assert len(capture) == 1, (
-            f"expected 1 captured activation, got {len(capture)}. "
-            f"Concurrent forward on the same thread?"
+            f"expected 1 captured activation, got {len(capture)}. Concurrent forward on the same thread?"
         )
         hidden = capture[0]  # [1, T, d]
         hidden_cpu = hidden.float().cpu()

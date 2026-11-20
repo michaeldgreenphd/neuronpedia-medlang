@@ -188,7 +188,7 @@ export function getHeadMetricsTooltip(showFirstParagraph = true) {
       <p>
         For our specific implementation for Neuronpedia, check out our{' '}
         <a
-          href="https://github.com/neuronpedia/neuronpedia/blob/main/utils/neuronpedia-utils/neuronpedia_utils/headvis/compute-head-metrics.py"
+          href="https://github.com/hijohnnylin/neuronpedia/blob/main/utils/neuronpedia-utils/neuronpedia_utils/headvis/compute-head-metrics.py"
           target="_blank"
           rel="noreferrer"
           className="font-bold text-sky-700 hover:underline"
@@ -244,6 +244,8 @@ export default function ModelHeadMetricsPane({
   initialLayer,
   initialHeadIndex,
   onHeadChange,
+  inferenceEnabled = false,
+  defaultCustomText,
 }: {
   modelId: string;
   metrics: ModelHeadMetricsRow[];
@@ -253,6 +255,10 @@ export default function ModelHeadMetricsPane({
   initialHeadIndex?: number;
   // Notified when the selected head changes (head-page mode), e.g. so breadcrumbs can stay in sync.
   onHeadChange?: (head: { modelId: string; layer: number; headIndex: number }) => void;
+  // When true (model has an inference host), enable the per-head custom-text box.
+  inferenceEnabled?: boolean;
+  // Custom text (from the `defaulttesttext` URL param) to auto-run against the initially selected head.
+  defaultCustomText?: string;
 }) {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -467,14 +473,18 @@ export default function ModelHeadMetricsPane({
     : null;
 
   const { layerOptions, headIndexOptions } = useMemo(() => {
-    let maxLayer = 0;
+    // Layers can be non-contiguous for hybrid models (e.g. Qwen3-Next / Qwen3.5+),
+    // where only every Nth layer is a full-attention layer with head metrics. Build
+    // the layer list from the layers actually present rather than assuming 0..max.
+    const layersSet = new Set<number>();
     let maxHeadIndex = 0;
     finderMetrics.forEach((metric) => {
-      if (metric.layer > maxLayer) maxLayer = metric.layer;
+      layersSet.add(metric.layer);
       if (metric.headIndex > maxHeadIndex) maxHeadIndex = metric.headIndex;
     });
     return {
-      layerOptions: Array.from({ length: maxLayer + 1 }, (_, i) => i),
+      layerOptions: Array.from(layersSet).sort((a, b) => a - b),
+      // Head indices are dense (num_attention_heads is uniform across layers).
       headIndexOptions: Array.from({ length: maxHeadIndex + 1 }, (_, i) => i),
     };
   }, [finderMetrics]);
@@ -484,7 +494,7 @@ export default function ModelHeadMetricsPane({
   };
 
   const selectHeadIndex = (headIndex: number) => {
-    setSelectedHead((prev) => ({ layer: prev?.layer ?? 0, headIndex }));
+    setSelectedHead((prev) => ({ layer: prev?.layer ?? layerOptions[0] ?? 0, headIndex }));
   };
 
   // Switching models on the head page invalidates the current selection: the new model may not
@@ -758,6 +768,7 @@ export default function ModelHeadMetricsPane({
               defaultModelId={modelId}
               includeHeads
               numHeadLayers={layerOptions.length}
+              headLayers={layerOptions}
               numHeadIndexes={headIndexOptions.length}
               defaultHeadLayer={selectedHead?.layer}
               defaultIndex={selectedHead?.headIndex?.toString()}
@@ -1265,6 +1276,12 @@ export default function ModelHeadMetricsPane({
                 isLoading={isLoadingSequences}
                 errorMessage={sequencesError}
                 unbounded={!showCard}
+                inferenceEnabled={inferenceEnabled}
+                defaultCustomText={
+                  selectedHead.layer === initialLayer && selectedHead.headIndex === initialHeadIndex
+                    ? defaultCustomText
+                    : undefined
+                }
               />
             ) : (
               <div className="flex h-full min-h-[12rem] w-full items-center justify-center px-4 text-center">
